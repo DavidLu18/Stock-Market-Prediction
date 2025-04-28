@@ -1,0 +1,8 @@
+{
+    "default_ticker": "AAPL",
+    "default_lookback": 60,
+    "default_forecast": 7,
+    "reddit_client_id": "aVxUHjXr1mwHAc2RmXFFdA",
+    "reddit_client_secret": "Xdo6Ld642pHODnw9yADzlGuI1Xo39A",
+    "reddit_user_agent": "StockPredictionApp/1.0"
+}

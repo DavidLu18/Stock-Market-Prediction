@@ -1,0 +1,46 @@
+# Core Data Science & ML
+pandas>=1.5.0,<2.3.0
+numpy>=1.21.0,<2.0.0
+scikit-learn>=1.1.0,<1.6.0
+scipy>=1.9.0,<1.14.0
+joblib>=1.2.0,<1.5.0
+statsmodels>=0.13.0,<0.15.0 # For time series decomposition
+
+# Deep Learning
+
+
+# Web App & Plotting
+streamlit>=1.20.0,<2.0.0
+plotly>=5.10.0,<6.0.0
+matplotlib>=3.5.0,<3.10.0
+Pillow>=9.0.0,<11.0.0
+
+# Data Collection & APIs
+yfinance>=0.2.0,<0.3.0
+requests>=2.28.0,<2.33.0
+praw>=7.6.0,<8.0.0
+psaw # Potentially used by PRAW or other Reddit tools, keep for now
+alpha_vantage>=2.3.0,<3.0.0
+finnhub-python>=2.4.0,<3.0.0
+pandas-datareader>=0.10.0,<0.11.0 # For FRED data
+
+# Web Scraping (for Google Trends)
+beautifulsoup4>=4.11.0,<4.13.0
+selenium>=4.8.0,<4.23.0
+webdriver-manager>=4.0.0,<5.0.0
+
+# NLP / Sentiment
+nltk>=3.7,<3.9
+# Note: After installing nltk, run Python and execute:
+# import nltk
+# nltk.download('vader_lexicon')
+
+# Technical Indicators
+# TA-Lib requires separate installation steps depending on your OS.
+# For Windows (Python 3.11, 64-bit), you might use the provided wheel file:
+# pip install ta_lib-0.6.3-cp311-cp311-win_amd64.whl
+# Or follow instructions at: https://github.com/mrjbq7/ta-lib
+# ta-lib
+
+# Temporal Features
+holidays>=0.13 # For US holiday identification

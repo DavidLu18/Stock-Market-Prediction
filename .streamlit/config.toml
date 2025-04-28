@@ -1,0 +1,17 @@
+[server]
+enableStaticServing = true
+headless = true
+
+[theme]
+primaryColor = "#FF007F"  # Dark pink
+backgroundColor = "#0E1117"  # Dark background
+secondaryBackgroundColor = "#31333F"
+textColor = "#FAFAFA"
+font = "sans serif"
+
+[runner]
+# This helps with PyTorch/Streamlit compatibility issues
+fastReruns = false
+
+[browser]
+gatherUsageStats = false
