@@ -1,591 +1,753 @@
 import os
+import json
+import joblib
 import pandas as pd
 import numpy as np
-import joblib
-import json
-import traceback
-import time
-import datetime
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, precision_recall_curve
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 import optuna
-import matplotlib.pyplot as plt
-import seaborn as sns
+# Not using LightGBMPruningCallback directly for PyTorch, Optuna has its own pruning for PyTorch trials
+# from optuna.integration import LightGBMPruningCallback
 
-# Import LightGBM and check GPU support
-try:
-    import lightgbm as lgb
-    LIGHTGBM_AVAILABLE = True
-    try:
-        lgb.LGBMClassifier(device='gpu')
-        LGBM_GPU_SUPPORT = True
-        print("LightGBM GPU support detected.")
-    except Exception as e:
-        print(f"Warning: LightGBM GPU support check failed: {e}. Will attempt CPU training.")
-        LGBM_GPU_SUPPORT = False
-except ImportError:
-    LIGHTGBM_AVAILABLE = False; LGBM_GPU_SUPPORT = False
-    print("ERROR: lightgbm library not found."); exit()
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    confusion_matrix, precision_recall_curve
+)
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional, Any, Callable
 
-# Directory setup (Assume running relative to app.py or specific environment)
-# If running standalone, adjust BASE_DIR
-try: BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # Assumes model_training is in a subdir
-except NameError: BASE_DIR = os.getcwd() # Fallback for interactive sessions
-DATA_DIR_INPUT = '/kaggle/input/newway01/data' # <<< Point to WHERE PROCESSED DATA IS <<<
-MODEL_DIR_OUTPUT = '/kaggle/working/' # <<< Point to WHERE MODELS SHOULD BE SAVED <<<
+# --- Directory Setup ---
+SCRIPT_DIR_MT = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR_MT = SCRIPT_DIR_MT
+DATA_DIR_MT = os.path.join(ROOT_DIR_MT, 'data')
+PROCESSED_DATA_DIR_MT = os.path.join(DATA_DIR_MT, 'processed')
+MODEL_DIR_MT = os.path.join(ROOT_DIR_MT, 'models')
 
-# Use environment variables if defined (e.g., for Kaggle)
-PROCESSED_DATA_DIR = '/kaggle/input/newway01/data/processed'
-MODEL_DIR = os.environ.get('MODEL_OUTPUT_PATH', MODEL_DIR_OUTPUT)
+for dir_path in [MODEL_DIR_MT]:
+    if not os.path.exists(dir_path):
+        try: os.makedirs(dir_path); print(f"(ModelTraining) Created directory: {dir_path}")
+        except OSError as e: print(f"(ModelTraining) Error creating directory {dir_path}: {e}")
 
-# Create MODEL_DIR if it doesn't exist
-if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
-if not os.path.exists(PROCESSED_DATA_DIR):
-    raise FileNotFoundError(f"Input data directory not found: {PROCESSED_DATA_DIR}")
-else:
-    print(f"Using processed data from: {PROCESSED_DATA_DIR}")
-    print(f"Saving models to: {MODEL_DIR}")
+# --- Constants ---
+COL_DATE = 'Date'
+COL_TICKER = 'Ticker'
+COL_OPEN = 'Open'
+COL_HIGH = 'High'
+COL_LOW = 'Low'
+COL_CLOSE = 'Close'
+COL_ADJ_CLOSE = 'Adj Close'
+COL_VOLUME = 'Volume'
+COL_TARGET = 'Target_Trend_Up'
+COL_LOG_RETURN = 'Log_Return'
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# --- Feature Engineering (v4 - kept from original, can be enhanced for DL) ---
+def engineer_advanced_features(df_input: pd.DataFrame, status_callback: Optional[Callable[[str, bool, int], None]] = None) -> pd.DataFrame:
+    if status_callback: status_callback("Starting advanced feature engineering (v4 style for ResNLS)...", False, 0)
+    df = df_input.copy()
 
-# --- Feature Engineering Function (DISABLED) ---
-# >>> This function is NOT called when using pre-processed features <<<
-def engineer_features(df):
-    print("SKIPPING internal feature engineering. Using features from input CSV.")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if COL_DATE in df.columns:
+            df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors='coerce')
+            df = df.set_index(COL_DATE)
+        else:
+            if status_callback: status_callback("DataFrame needs DatetimeIndex or 'Date' column for advanced features.", True, 0); return df_input
+    df = df.sort_index()
+
+    # Ensure basic price columns are numeric
+    for col in [COL_OPEN, COL_HIGH, COL_LOW, COL_CLOSE, COL_ADJ_CLOSE, COL_VOLUME]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    price_col_for_log_return = COL_ADJ_CLOSE if COL_ADJ_CLOSE in df.columns and df[COL_ADJ_CLOSE].isnull().sum() < len(df) else COL_CLOSE
+    if price_col_for_log_return in df.columns:
+        df[COL_LOG_RETURN] = np.log(df[price_col_for_log_return].replace(0, np.nan) / df[price_col_for_log_return].shift(1).replace(0, np.nan))
+        if status_callback: status_callback(f"Calculated '{COL_LOG_RETURN}' using '{price_col_for_log_return}'.", False, 1)
+    else:
+        if status_callback: status_callback(f"Price columns for '{COL_LOG_RETURN}' missing or all NaN.", True, 1)
+        df[COL_LOG_RETURN] = 0.0 # Add placeholder if calculation fails
+
+    if COL_LOG_RETURN in df.columns:
+        for window in [30, 60, 90, 120, 180]:
+            col_name = f'Volatility_{window}D'
+            df[col_name] = df[COL_LOG_RETURN].rolling(window=window, min_periods=int(window*0.6)).std(ddof=0) * np.sqrt(window) # Annualized for window
+            if status_callback: status_callback(f"Engineered {col_name}", False, 1)
+
+    # Interaction features (example)
+    common_vol_col = 'Volatility_60D'
+    if 'RSI_14' in df.columns and common_vol_col in df.columns: df['RSI_x_Volatility'] = df['RSI_14'] * df[common_vol_col]
+    if 'MACD' in df.columns and common_vol_col in df.columns: df['MACD_x_Volatility'] = df['MACD'] * df[common_vol_col]
+    if 'MFI_14' in df.columns and common_vol_col in df.columns: df['MFI_x_Volatility'] = df['MFI_14'] * df[common_vol_col]
+
+    indicators_to_lag = {
+        'RSI_14': [1, 3, 5, 10], 'MACD': [1, 3, 5, 10], 'MACD_Hist': [1, 3, 5],
+        'SlowK': [1, 3, 5], 'ADX_14': [1,3,5], COL_LOG_RETURN: [1,2,3,5,10] # Added Log_Return lags directly here
+    }
+    for indicator, lags in indicators_to_lag.items():
+        if indicator in df.columns:
+            for lag in lags: df[f'{indicator}_Lag_{lag}'] = df[indicator].shift(lag)
+            if status_callback: status_callback(f"Lags for {indicator}", False, 1)
+
+    if isinstance(df.index, pd.DatetimeIndex):
+        df['DayOfWeek_Sin'] = np.sin(2 * np.pi * df.index.dayofweek / 6.0)
+        df['DayOfWeek_Cos'] = np.cos(2 * np.pi * df.index.dayofweek / 6.0)
+        df['Month_Sin'] = np.sin(2 * np.pi * df.index.month / 12.0)
+        df['Month_Cos'] = np.cos(2 * np.pi * df.index.month / 12.0)
+        df['DayOfYear_Sin'] = np.sin(2 * np.pi * df.index.dayofyear / 365.0)
+        df['DayOfYear_Cos'] = np.cos(2 * np.pi * df.index.dayofyear / 365.0)
+        if status_callback: status_callback("Cyclical time features", False, 1)
+
+    if 'VIX' in df.columns:
+        df['VIX_Roll_Mean_5'] = df['VIX'].rolling(window=5, min_periods=1).mean()
+        df['VIX_Roll_Mean_20'] = df['VIX'].rolling(window=20, min_periods=1).mean()
+        df['VIX_vs_Mean_20'] = (df['VIX'] / df['VIX_Roll_Mean_20'].replace(0,np.nan)) - 1
+        if status_callback: status_callback("VIX-based features", False, 1)
+
+    if 'Market_Return' in df.columns:
+         df['Market_Return_Lag_1'] = df['Market_Return'].shift(1)
+         df['Market_Return_Roll_Sum_3D'] = df['Market_Return'].rolling(window=3, min_periods=1).sum()
+         df['Market_Return_Roll_Sum_5D'] = df['Market_Return'].rolling(window=5, min_periods=1).sum()
+         if status_callback: status_callback("Market_Return derived features", False, 1)
+
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    # Smart fill: ffill for most, but for things like returns or volatility, 0 might be better if no prior data
+    df[numeric_cols] = df[numeric_cols].ffill().bfill() # Generic fill first
+    for col in numeric_cols: # Specific fills for some common features
+        if 'Return' in col or 'Volatility' in col or 'MACD_Hist' in col:
+             df[col].fillna(0, inplace=True)
+    df.fillna(0, inplace=True) # Catch-all for any remaining NaNs
+
+    if status_callback: status_callback("Advanced feature engineering complete.", False, 0)
     return df
 
-# --- Helper Functions (Keep create_future_target, prepare_data, get_splits) ---
+# --- Target Variable Definition ---
+def create_target_variable(df: pd.DataFrame, forecast_horizon: int, threshold: float,
+                           status_callback: Optional[Callable[[str, bool, int], None]] = None) -> pd.DataFrame:
+    if status_callback: status_callback(f"Creating target: {forecast_horizon}d horizon, {threshold*100:.2f}% threshold...", False, 0)
+    df_target = df.copy()
+    price_col_for_target = COL_ADJ_CLOSE if COL_ADJ_CLOSE in df_target.columns and not df_target[COL_ADJ_CLOSE].isnull().all() else COL_CLOSE
 
-def create_future_target(df, target_col_base='Close', horizon=5):
-    """Creates the N-day future return and binary target variable."""
-    # (Giữ nguyên logic)
-    print(f"  Creating {horizon}-day future target based on '{target_col_base}'...")
-    if target_col_base not in df.columns: return df, None
-    if not pd.api.types.is_numeric_dtype(df[target_col_base]): return df, None
-    df_copy = df.copy(); target_name = f'Price_Increase_{horizon}D'
-    try:
-        df_copy[f'{target_col_base}_Future_{horizon}D'] = df_copy[target_col_base].shift(-horizon)
-        current_price = df_copy[target_col_base]
-        future_price = df_copy[f'{target_col_base}_Future_{horizon}D']
-        df_copy[f'Future_Return_{horizon}D'] = np.where(
-            current_price.isna() | (current_price == 0) | future_price.isna(), np.nan,
-            (future_price - current_price) / current_price)
-        df_copy[target_name] = np.where(df_copy[f'Future_Return_{horizon}D'].isna(), np.nan,
-                                       (df_copy[f'Future_Return_{horizon}D'] > 0).astype(int))
-        df_out = pd.merge(df, df_copy[[target_name]], left_index=True, right_index=True, how='left')
-        original_len = len(df_out)
-        df_out.dropna(subset=[target_name], inplace=True)
-        rows_dropped = original_len - len(df_out)
-        print(f"  Target '{target_name}' created. Dropped {rows_dropped} rows.")
-        df_out[target_name] = df_out[target_name].astype(int)
-        return df_out, target_name
-    except Exception as e: print(f"  Error creating target: {e}"); return df, None
+    if price_col_for_target not in df_target.columns or df_target[price_col_for_target].isnull().all():
+        if status_callback: status_callback(f"'{price_col_for_target}' missing or all NaN. Cannot create target.", True, 1)
+        df_target[COL_TARGET] = 0 # Assign a default target if price is unusable
+        return df_target
 
-def prepare_data_tree_nday(df, feature_columns, target_column_nday):
-    """Prepares data for tree models using pre-existing features."""
-    # (Giữ nguyên logic - làm sạch NaN/inf, chọn cột)
-    if target_column_nday not in df.columns: print(f"E: Target '{target_column_nday}' not found."); return None, None
-    df_clean = df.copy()
-    feature_columns_present = [f for f in feature_columns if f in df_clean.columns]
-    missing = list(set(feature_columns) - set(feature_columns_present))
-    if missing: print(f"W: {len(missing)} features missing: {missing[:5]}... Using {len(feature_columns_present)}.")
-    if not feature_columns_present: print("E: No usable features."); return None, None
-    cols_to_keep = feature_columns_present + [target_column_nday]
-    try: df_clean = df_clean[cols_to_keep]
-    except KeyError as e: print(f"E: KeyError selecting columns: {e}. Available: {df_clean.columns.tolist()}"); return None, None
-    inf_before = np.isinf(df_clean[feature_columns_present].values).sum()
-    if inf_before > 0: df_clean.replace([np.inf, -np.inf], np.nan, inplace=True)
-    for col in feature_columns_present:
-        if not pd.api.types.is_numeric_dtype(df_clean[col]): df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
-    nan_after_convert = df_clean[feature_columns_present].isna().sum().sum()
-    if nan_after_convert > 0 or inf_before > 0:
-        df_clean = df_clean.ffill().bfill()
-        df_clean[feature_columns_present] = df_clean[feature_columns_present].fillna(0)
-    if df_clean[target_column_nday].isna().any():
-        nan_target = df_clean[target_column_nday].isna().sum()
-        print(f"W: {nan_target} NaN in target '{target_column_nday}'. Dropping rows.")
-        df_clean.dropna(subset=[target_column_nday], inplace=True)
-    if df_clean.empty: print("E: DataFrame empty after cleaning."); return None, None
-    X = df_clean[feature_columns_present]
-    y = df_clean[target_column_nday].astype(int)
-    if X.isna().any().any() or np.isinf(X.values).any(): print("E: NaN/Inf still in features! Final fillna(0)."); X = X.fillna(0).replace([np.inf, -np.inf], 0)
-    return X, y
+    future_price = df_target[price_col_for_target].shift(-forecast_horizon)
+    # Ensure current price is not zero to avoid division by zero
+    current_price_safe = df_target[price_col_for_target].replace(0, np.nan)
+    perc_change = (future_price - current_price_safe) / current_price_safe
 
-def get_walk_forward_splits_rf(df, num_splits, min_train_perc=0.3, test_period_days=None, gap_days=1):
-    """Generates walk-forward splits."""
-    # (Giữ nguyên logic - kiểm tra ngày tháng bất thường đã được thêm)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        try: df.index = pd.to_datetime(df.index); df = df.sort_index(); print("Converted index to DatetimeIndex.")
-        except Exception as e: print(f"W: Index conversion failed: {e}. Proceeding..."); df = df.sort_index()
-    total_len = len(df); min_required = int(num_splits * 2 * max(10, gap_days)) + 100
-    if total_len < min_required: raise ValueError(f"Data size ({total_len}) too small for {num_splits} splits/gap {gap_days}.")
-    initial_train_size = max(50, int(total_len * min_train_perc))
-    if test_period_days is None: rem = total_len - initial_train_size - (num_splits * gap_days); val_size = max(10, rem // num_splits) if rem > 0 else 10
-    else: val_size = test_period_days
-    max_initial_train = total_len - num_splits * (val_size + gap_days)
-    initial_train_size = min(initial_train_size, max(50, max_initial_train))
-    if initial_train_size < 50: raise ValueError(f"Initial train size ({initial_train_size}) too small.")
-    print(f"\nGenerating {num_splits} walk-forward splits:"); print(f"  Total data: {total_len}, Initial train: ~{initial_train_size}, Gap: {gap_days}d")
-    train_end_idx = initial_train_size; split_count = 0
-    for i in range(num_splits):
-        current_split_num = i + 1; train_start_idx = 0
-        validation_start_idx = train_end_idx + gap_days
-        if test_period_days: validation_end_idx = validation_start_idx + test_period_days
-        else: rem_val = total_len - validation_start_idx; step_size = max(10, rem_val // (num_splits - i)) if rem_val > 0 and (num_splits - i)>0 else 10; validation_end_idx = validation_start_idx + step_size
-        validation_end_idx = min(validation_end_idx, total_len)
-        if validation_start_idx >= total_len or validation_end_idx <= validation_start_idx: print(f"W: Not enough data for val split {current_split_num}. Stopping."); break
-        train_df = df.iloc[train_start_idx : train_end_idx]; validation_df = df.iloc[validation_start_idx : validation_end_idx]
-        if train_df.empty or validation_df.empty: print(f"W: Empty train/val set for split {current_split_num}. Stopping."); break
-        split_count += 1
-        print(f"\n  Split {split_count}/{num_splits}:")
+    df_target[COL_TARGET] = np.where(perc_change >= threshold, 1, 0).astype(int)
+
+    # Remove rows where target cannot be calculated (typically last `forecast_horizon` rows)
+    df_target.dropna(subset=[COL_TARGET], inplace=True)
+    if status_callback: status_callback("Target variable created and NaN rows dropped.", False, 0)
+    return df_target
+
+# --- PyTorch ResNLS Model ---
+class ResNetBlock1D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dropout_rate=0.2):
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 1, padding, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += self.shortcut(identity)
+        out = self.relu(out)
+        return out
+
+class ResNLS(nn.Module):
+    def __init__(self, num_features, seq_len, resnet_blocks=2, resnet_out_channels=64,
+                 lstm_hidden_size=128, lstm_layers=2, fc_hidden_size=64, dropout_rate=0.3):
+        super().__init__()
+        self.seq_len = seq_len
+
+        layers = []
+        current_channels = num_features
+        for _ in range(resnet_blocks):
+            layers.append(ResNetBlock1D(current_channels, resnet_out_channels, kernel_size=3, dropout_rate=dropout_rate))
+            current_channels = resnet_out_channels
+        self.resnet = nn.Sequential(*layers)
+
+        self.lstm = nn.LSTM(input_size=resnet_out_channels, hidden_size=lstm_hidden_size,
+                            num_layers=lstm_layers, batch_first=True, dropout=dropout_rate if lstm_layers > 1 else 0)
+
+        self.fc_block = nn.Sequential(
+            nn.Linear(lstm_hidden_size, fc_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(fc_hidden_size, 1) # Output for binary classification
+        )
+
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, num_features)
+        x = x.permute(0, 2, 1)  # (batch_size, num_features, seq_len) for Conv1D
+        x = self.resnet(x)      # (batch_size, resnet_out_channels, seq_len_after_resnet)
+
+        x = x.permute(0, 2, 1)  # (batch_size, seq_len_after_resnet, resnet_out_channels) for LSTM
+
+        lstm_out, _ = self.lstm(x) # lstm_out: (batch_size, seq_len, lstm_hidden_size)
+
+        # Use the output of the last LSTM time step
+        last_lstm_out = lstm_out[:, -1, :] # (batch_size, lstm_hidden_size)
+
+        out = self.fc_block(last_lstm_out) # (batch_size, 1)
+        return out
+
+# --- PyTorch Dataset & Data Preparation ---
+def create_sequences(data: pd.DataFrame, target: pd.Series, seq_length: int):
+    X_seq, y_seq = [], []
+    for i in range(len(data) - seq_length): # Target already aligned (no future data needed for y)
+        X_seq.append(data.iloc[i:i + seq_length].values)
+        y_seq.append(target.iloc[i + seq_length -1]) # Target for the END of the sequence
+    return np.array(X_seq), np.array(y_seq)
+
+class StockDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# --- Training and Evaluation Loop ---
+def train_epoch(model, dataloader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    all_preds, all_targets = [], []
+    for X_batch, y_batch in dataloader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+        preds = torch.sigmoid(outputs).round().cpu().detach().numpy()
+        all_preds.extend(preds.flatten())
+        all_targets.extend(y_batch.cpu().detach().numpy().flatten())
+
+    avg_loss = total_loss / len(dataloader)
+    acc = accuracy_score(all_targets, all_preds)
+    f1 = f1_score(all_targets, all_preds, zero_division=0)
+    return avg_loss, acc, f1
+
+def evaluate_epoch(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_preds_proba, all_targets = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in dataloader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            total_loss += loss.item()
+
+            probs = torch.sigmoid(outputs).cpu().detach().numpy()
+            all_preds_proba.extend(probs.flatten())
+            all_targets.extend(y_batch.cpu().detach().numpy().flatten())
+
+    avg_loss = total_loss / len(dataloader)
+
+    if len(np.unique(all_targets)) < 2: # Handle case where validation set has only one class
+        roc_auc = 0.5
         try:
-            print(f"    Train: {train_df.index.min().date()} - {train_df.index.max().date()} ({len(train_df)} pts)")
-            print(f"    Val:   {validation_df.index.min().date()} - {validation_df.index.max().date()} ({len(validation_df)} pts)")
-            if validation_df.index.max() > pd.Timestamp.now() + pd.Timedelta(days=1): print(f"    <<<< CRITICAL WARNING >>>> Val data has future dates ({validation_df.index.max().date()})!")
-        except AttributeError: print(f"    Train/Val Index not datetime: {train_df.index.min()} - {validation_df.index.max()}")
-        yield train_df, validation_df
-        train_end_idx = validation_end_idx - gap_days; train_end_idx = max(initial_train_size, train_end_idx)
-    if split_count < num_splits: print(f"\nW: Only generated {split_count}/{num_splits} splits.")
-
-
-# --- LGBM Training/Evaluation Function ---
-def train_evaluate_lgbm_fold(train_df, validation_df, feature_columns, target_column_nday, params, use_gpu):
-    """Trains and evaluates a LightGBM model on a single fold."""
-    # (Giữ nguyên logic)
-    if not LIGHTGBM_AVAILABLE: return None, {'error': 'LGBM not available'}, None
-    model, scaler, metrics = None, None, {}; fold_start_time = time.time()
-    try:
-        X_train_raw, y_train = prepare_data_tree_nday(train_df, feature_columns, target_column_nday)
-        X_val_raw, y_val = prepare_data_tree_nday(validation_df, feature_columns, target_column_nday)
-        if X_train_raw is None or X_val_raw is None or y_train is None or y_val is None or X_train_raw.empty or X_val_raw.empty: return None, {'error': 'Data prep failed'}, None
-        if len(y_train.unique()) < 2: return None, {'error': f'Single class ({y_train.unique()}) in train'}, None
-        if len(y_val) == 0: return None, {'error': 'Empty validation target'}, None
-        if len(X_train_raw) < 20 or len(X_val_raw) < 10: return None, {'error': f'Samples train({len(X_train_raw)}<20)/val({len(X_val_raw)}<10)'}, None
-        scaler = StandardScaler(); X_train = scaler.fit_transform(X_train_raw); X_val = scaler.transform(X_val_raw)
-        lgbm_class_weight_param = params.pop('class_weight', None); scale_pos_weight_param = params.pop('scale_pos_weight', None)
-        effective_scale_pos_weight = None; lgbm_class_weight = None
-        if lgbm_class_weight_param == 'balanced': lgbm_class_weight = 'balanced'
-        elif scale_pos_weight_param is not None: effective_scale_pos_weight = scale_pos_weight_param
-        else: n_neg, n_pos = (y_train == 0).sum(), (y_train == 1).sum(); effective_scale_pos_weight = n_neg / n_pos if n_pos > 0 and n_neg > 0 else None
-        lgbm_extra_params = {'device': 'gpu'} if use_gpu and LGBM_GPU_SUPPORT else {'device': 'cpu'}
-        model = lgb.LGBMClassifier(objective='binary', metric='auc', random_state=42, n_jobs=-1, class_weight=lgbm_class_weight, scale_pos_weight=effective_scale_pos_weight, **params, **lgbm_extra_params)
-        eval_set = [(X_val, y_val)]; callbacks = [lgb.early_stopping(stopping_rounds=50, verbose=False)]
-        model.fit(X_train, y_train, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
-        y_pred_proba = model.predict_proba(X_val)[:, 1]; y_pred_class = (y_pred_proba >= 0.5).astype(int)
-        accuracy = accuracy_score(y_val, y_pred_class); precision = precision_score(y_val, y_pred_class, pos_label=1, zero_division=0); recall = recall_score(y_val, y_pred_class, pos_label=1, zero_division=0); f1 = f1_score(y_val, y_pred_class, pos_label=1, zero_division=0); roc_auc = np.nan
-        if len(np.unique(y_val)) > 1:
-            try: roc_auc = roc_auc_score(y_val, y_pred_proba)
-            except ValueError as e: print(f"W: ROC AUC calc failed: {e}"); roc_auc = np.nan
-        else: roc_auc = 0.0
-        try: cm = confusion_matrix(y_val, y_pred_class)
-        except ValueError: cm = np.array([[0,0],[0,0]]); # Handle single class y_val
-        metrics = {'accuracy': accuracy, 'roc_auc': roc_auc if pd.notna(roc_auc) else 0.0, 'precision_positive': precision, 'recall_positive': recall, 'f1_positive': f1, 'confusion_matrix': cm.tolist(), 'num_val_samples': len(y_val), 'val_positive_ratio': y_val.mean() if len(y_val) > 0 else 0.0, 'best_iteration': model.best_iteration_ if hasattr(model, 'best_iteration_') and model.best_iteration_ is not None else params.get('n_estimators', -1)}
-        if lgbm_class_weight_param == 'balanced': params['class_weight'] = 'balanced' # Restore params
-        if scale_pos_weight_param is not None: params['scale_pos_weight'] = scale_pos_weight_param
-        return model, metrics, scaler
-    except Exception as e: print(f"Error in fold: {e}"); #traceback.print_exc()
-    return None, {'error': str(e)}, scaler # Return scaler even on error
-
-
-# --- Optuna Objective Function ---
-def objective_lgbm(trial, df_full_with_target, feature_columns, target_column_nday, num_splits, use_gpu):
-    """Optuna objective function."""
-    # (Giữ nguyên logic với không gian siêu tham số đã cải tiến)
-    if not LIGHTGBM_AVAILABLE: raise ImportError("LGBM not found.")
-    params = {
-        'n_estimators': trial.suggest_int('n_estimators', 500, 4000, step=100), 'learning_rate': trial.suggest_float('learning_rate', 0.008, 0.08, log=True),
-        'num_leaves': trial.suggest_int('num_leaves', 20, 300), 'max_depth': trial.suggest_int('max_depth', 5, 35), 'min_child_samples': trial.suggest_int('min_child_samples', 10, 100),
-        'reg_alpha': trial.suggest_float('reg_alpha', 1e-4, 10.0, log=True), 'reg_lambda': trial.suggest_float('reg_lambda', 1e-4, 10.0, log=True),
-        'subsample': trial.suggest_float('subsample', 0.6, 1.0, step=0.05), 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0, step=0.05),
-        'weighting_strategy': trial.suggest_categorical('weighting_strategy', ['none', 'scale_pos_weight_calc']),
-        'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 0.05), 'boosting_type': trial.suggest_categorical('boosting_type', ['gbdt', 'dart']),
-    }
-    weighting_strategy = params.pop('weighting_strategy'); params['class_weight'] = None; params['scale_pos_weight'] = None
-    fold_metrics_list = []; fold_num = 0; total_fold_time = 0
-    split_generator = get_walk_forward_splits_rf(df_full_with_target, num_splits, gap_days=3)
-    for train_fold_df, validation_fold_df in split_generator:
-        fold_num += 1; fold_start_time = time.time(); fold_params = params.copy()
-        if weighting_strategy == 'scale_pos_weight_calc': fold_params['scale_pos_weight'] = None
-        model, metrics, _ = train_evaluate_lgbm_fold(train_fold_df, validation_fold_df, feature_columns, target_column_nday, fold_params, use_gpu)
-        fold_duration = time.time() - fold_start_time; total_fold_time += fold_duration
-        if model and metrics and 'accuracy' in metrics and pd.notna(metrics['accuracy']) and 'error' not in metrics:
-            fold_metrics_list.append(metrics); acc_fold = metrics.get('accuracy', 0.0); f1_fold = metrics.get('f1_positive', 0.0)
-            objective_value_fold = (0.4 * acc_fold) + (0.6 * f1_fold); trial.report(-objective_value_fold, fold_num)
-            if trial.should_prune(): raise optuna.exceptions.TrialPruned()
-        else: error_msg = metrics.get('error', 'Unknown'); trial.report(float('-inf'), fold_num); # Report bad score
-        if fold_num <= 1 and ('error' in metrics or not model): raise optuna.exceptions.TrialPruned(f"Failed fold {fold_num}: {error_msg}") # Prune early
-    if not fold_metrics_list: return float('inf')
-    avg_metrics = {}; metric_keys = ['accuracy', 'f1_positive', 'precision_positive', 'recall_positive', 'roc_auc']
-    for key in metric_keys: valid_values = [m[key] for m in fold_metrics_list if key in m and pd.notna(m[key])]; avg_metrics[key] = np.mean(valid_values) if valid_values else 0.0
-    avg_metrics['num_successful_folds'] = len(fold_metrics_list); avg_metrics['avg_val_positive_ratio'] = np.mean([m.get('val_positive_ratio', 0.0) for m in fold_metrics_list])
-    valid_iters = [m['best_iteration'] for m in fold_metrics_list if m.get('best_iteration', -1) > 0]; avg_metrics['avg_best_iteration'] = np.mean(valid_iters) if valid_iters else -1.0
-    trial.set_user_attr('avg_metrics', avg_metrics)
-    final_acc = avg_metrics.get('accuracy', 0.0); final_f1 = avg_metrics.get('f1_positive', 0.0); final_weighted_score = (0.4 * final_acc) + (0.6 * final_f1)
-    return -final_weighted_score
-
-# --- Optuna Optimization Runner ---
-# <<< SỬA ĐỔI: Bỏ tham số feature_columns, lấy từ PRE_EXISTING_FEATURES_LIST >>>
-def run_optuna_optimization_lgbm(processed_files, forecast_horizon, n_trials, num_splits, use_gpu=True):
-    """Runs Optuna optimization using PRE-EXISTING features from processed files."""
-    global df_full_final
-    if not LIGHTGBM_AVAILABLE: print("E: LightGBM not installed."); return None, None, None, None, None
-
-    # --- LIST OF EXPECTED PRE-EXISTING FEATURES ---
-    # <<< QUAN TRỌNG: Danh sách này phải khớp với các cột trong file *_processed_data.csv >>>
-    PRE_EXISTING_FEATURES_LIST = [
-        'Open', 'High', 'Low', 'Close', 'Volume', 'Compound', 'Positive', 'Neutral', 'Negative', 'Count',
-        'Interest', 'FEDFUNDS', 'SMA_5', 'SMA_20', 'SMA_50', 'EMA_5', 'EMA_20', 'RSI', 'MACD',
-        'MACD_Signal', 'MACD_Hist', 'BB_Upper', 'BB_Middle', 'BB_Lower', 'SlowK', 'SlowD', 'ADX',
-        'Chaikin_AD', 'OBV', 'ATR', 'Williams_R', 'ROC', 'CCI', 'Close_Open_Ratio', 'High_Low_Diff',
-        'Close_Prev_Ratio', 'Close_Lag_1', 'Volume_Lag_1', 'Compound_Lag_1', 'Interest_Lag_1', 'FEDFUNDS_Lag_1',
-        'Close_Lag_3', 'Volume_Lag_3', 'Compound_Lag_3', 'Interest_Lag_3', 'FEDFUNDS_Lag_3',
-        'Close_Lag_5', 'Volume_Lag_5', 'Compound_Lag_5', 'Interest_Lag_5', 'FEDFUNDS_Lag_5',
-        'Volatility_20D', 'Day_Of_Week'
-        # <<< Bỏ các cột target gốc hoặc cột không phải feature ở đây >>>
-    ]
-    print(f"\n--- Starting Optuna (LGBM {forecast_horizon}D Target - Pre-existing Features) ---")
-    print(f"Settings: Trials={n_trials}, Folds={num_splits}, GPU={use_gpu}")
-    start_time = time.time()
-
-    # --- 1. Load and Combine Data ---
-    print("Loading and combining processed data...")
-    all_dfs = []; loaded_files_count = 0
-    target_tickers = ['AAPL', 'AMZN', 'GOOG', 'GOOGL', 'LLY', 'META', 'MSFT', 'NVDA', 'TSLA', 'V'] # Define target tickers
-
-    for file_path in processed_files:
-        filename = os.path.basename(file_path)
-        # <<< Sửa đổi: Lấy ticker an toàn hơn >>>
-        try: ticker_in_filename = filename.split('_processed_data.csv')[0].upper()
-        except IndexError: continue # Skip if filename format is wrong
-        if ticker_in_filename in target_tickers: # Chỉ load các ticker mục tiêu
-            try:
-                df = pd.read_csv(file_path, index_col='Date', parse_dates=True)
-                if not isinstance(df.index, pd.DatetimeIndex): # Fallback parsing
-                    df = pd.read_csv(file_path, parse_dates=['Date']).set_index('Date')
-                if isinstance(df.index, pd.DatetimeIndex) and not df.empty:
-                    df = df.sort_index()
-                    # Bỏ các cột target gốc nếu có
-                    cols_to_drop = ['Close_Next', 'Price_Change', 'Price_Increase']
-                    df = df.drop(columns=[col for col in cols_to_drop if col in df.columns], errors='ignore')
-                    if 'Ticker' not in df.columns: df['Ticker'] = ticker_in_filename # Add ticker if missing
-                    all_dfs.append(df)
-                    loaded_files_count += 1
-                # else: print(f"W: Skipped {filename} due to index/empty issue.") # Bớt log
-            except Exception as e: print(f"E: Loading {filename}: {e}")
-        # else: print(f"Skipping {filename} (not in target list)") # Bớt log
-
-    if not all_dfs: print(f"E: No valid data loaded for target tickers. Searched in {PROCESSED_DATA_DIR}"); return None, None, None, None, None
-    print(f"\nLoaded data for {loaded_files_count} target tickers.")
-    df_full = pd.concat(all_dfs, axis=0).sort_index()
-
-    # Clean combined data (Remove rows where essential columns are all NaN)
-    print(f"Combined shape before cleaning: {df_full.shape}")
-    essential_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    initial_len = len(df_full); df_full.dropna(subset=essential_cols, how='all', inplace=True); rows_dropped = initial_len - len(df_full)
-    if rows_dropped > 0: print(f"Dropped {rows_dropped} potentially invalid rows.")
-    print(f"Combined shape after cleaning: {df_full.shape}")
-    if df_full.empty: print("E: Combined DataFrame empty after cleaning."); return None, None, None, None, None
-    try: # Verify date range
-        min_date, max_date = df_full.index.min(), df_full.index.max()
-        print(f"Verified Data Index Range: {min_date.date()} to {max_date.date()}")
-        if max_date > pd.Timestamp.now() + pd.Timedelta(days=7): print(f"<<<< CRITICAL WARNING >>>> Max date {max_date.date()} is in the future!")
-    except Exception as date_e: print(f"W: Could not verify date range: {date_e}")
-
-    # --- 2. Feature Engineering --> SKIPPED (Using pre-processed) ---
-    print("\nUsing pre-existing features from loaded files.")
-
-    # --- 3. Create N-Day Target Variable ---
-    print(f"\nCreating {forecast_horizon}-day target variable...")
-    df_full_final, target_column_nday = create_future_target(df_full, horizon=forecast_horizon, target_col_base='Close')
-    del df_full # Free memory
-
-    if target_column_nday is None or df_full_final is None or df_full_final.empty: print("E: Failed to create target or DataFrame empty."); return None, None, None, None, None
-    print(f"Target '{target_column_nday}' created. Final data shape: {df_full_final.shape}")
-    print(f"Target distribution:\n{df_full_final[target_column_nday].value_counts(normalize=True)}")
-
-    # --- 4. Final Feature Selection (Based on PRE_EXISTING_FEATURES_LIST) ---
-    print("\nDetermining final feature set from expected list...")
-    exclude_cols = ['Date', 'Ticker', 'Company', target_column_nday] + [col for col in df_full_final.columns if 'Future_' in col]
-    available_cols = df_full_final.columns.tolist()
-    # <<< SỬA ĐỔI: Dùng PRE_EXISTING_FEATURES_LIST làm cơ sở >>>
-    final_feature_columns = [col for col in PRE_EXISTING_FEATURES_LIST if col in available_cols and col not in exclude_cols]
-    missing_expected = list(set(PRE_EXISTING_FEATURES_LIST) - set(final_feature_columns) - set(exclude_cols))
-    if missing_expected: print(f"  W: {len(missing_expected)} expected features missing/excluded: {missing_expected[:5]}...")
-
-    print(f"Checking data types for {len(final_feature_columns)} potential features...")
-    cols_to_drop_type = []
-    for col in final_feature_columns:
-        if pd.api.types.is_numeric_dtype(df_full_final[col]):
-            if not (df_full_final[col].notna().sum() > 0 and np.isfinite(df_full_final[col]).sum() > 0): cols_to_drop_type.append(col) # Remove all NaN/Inf cols
-        else: # Try converting non-numeric
-            try: df_full_final[col] = pd.to_numeric(df_full_final[col], errors='raise')
-            except: cols_to_drop_type.append(col) # Remove if conversion fails
-
-    if cols_to_drop_type:
-        final_feature_columns = [col for col in final_feature_columns if col not in cols_to_drop_type]
-        print(f"  Removed {len(cols_to_drop_type)} non-numeric/invalid columns.")
-
-    print(f"Final feature set: {len(final_feature_columns)} numeric features.")
-    if not final_feature_columns: print("E: No numeric features remaining."); return None, None, None, None, None
-
-    # --- 5. Prepare & Run Optuna ---
-    # (Giữ nguyên logic setup và run Optuna)
-    print("\nSetting up Optuna study...")
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=2, interval_steps=1)
-    sampler = optuna.samplers.TPESampler(seed=42, multivariate=True, group=True, constant_liar=True)
-    study = optuna.create_study(direction='minimize', pruner=pruner, sampler=sampler, study_name=f'lgbm_{forecast_horizon}d_preproc_v3_{datetime.datetime.now().strftime("%Y%m%d_%H%M")}')
-    print(f"Starting Optuna optimization ({n_trials} trials)...")
-    try:
-        study.optimize(lambda trial: objective_lgbm(trial, df_full_final.copy(), final_feature_columns, target_column_nday, num_splits, use_gpu),
-                       n_trials=n_trials, gc_after_trial=True, show_progress_bar=True, n_jobs=1)
-    except KeyboardInterrupt: print("\nOptuna interrupted.")
-    except Exception as e: print(f"\nError during Optuna: {e}"); traceback.print_exc()
-    optimization_duration = time.time() - start_time
-    print(f"\n--- Optuna Complete ({optimization_duration:.2f}s) ---")
-
-    # --- 7. Process Results ---
-    # (Giữ nguyên logic xử lý kết quả Optuna)
-    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    if not completed_trials: print("E: No Optuna trials completed."); return None, None, None, None, None
-    try:
-        best_trial = study.best_trial; best_value = -best_trial.value if best_trial.value is not None else None
-        best_params_raw = best_trial.params; best_avg_metrics = best_trial.user_attrs.get('avg_metrics', {})
-        print(f"\nBest Trial: #{best_trial.number}"); print(f"Best Score: {best_value:.4f}" if best_value else "N/A")
-        best_params_cleaned = best_params_raw.copy(); best_params_cleaned.pop('weighting_strategy', None)
-        print("\nBest Hyperparameters:"); print(json.dumps(best_params_cleaned, indent=2))
-        print("\nBest Avg Metrics (Optuna):"); print(json.dumps(best_avg_metrics, indent=2, default=default_serializer))
-        if 'avg_best_iteration' in best_avg_metrics and best_avg_metrics['avg_best_iteration'] > 0: print(f"Avg Best Iteration: {best_avg_metrics['avg_best_iteration']:.1f}")
-    except Exception as e: print(f"E: Processing Optuna results: {e}"); return None, None, None, None, None
-
-    # --- 8. Final Model Training ---
-    # (Giữ nguyên logic huấn luyện model cuối cùng)
-    print("\n--- Training Final Model on Full Data ---")
-    final_model, final_scaler = None, None; train_duration = None
-    try:
-        X_final_raw, y_final = prepare_data_tree_nday(df_full_final, final_feature_columns, target_column_nday)
-        if X_final_raw is None: print("E: Final data prep failed."); return None, None, best_params_cleaned, best_avg_metrics, target_column_nday
-        print(f"Scaling final data ({X_final_raw.shape})..."); final_scaler = StandardScaler(); X_final_scaled = final_scaler.fit_transform(X_final_raw)
-        final_params = best_params_cleaned.copy(); final_ws = best_params_raw.get('weighting_strategy', 'none')
-        final_spw = None
-        if final_ws == 'scale_pos_weight_calc': n_neg, n_pos = (y_final == 0).sum(), (y_final == 1).sum(); final_spw = n_neg / n_pos if n_pos > 0 else None; print(f"  Final scale_pos_weight: {final_spw:.4f}")
-        final_extra = {'device': 'gpu'} if use_gpu and LGBM_GPU_SUPPORT else {'device': 'cpu'}; print(f"  Final device: {final_extra['device']}")
-        final_model = lgb.LGBMClassifier(objective='binary', random_state=42, n_jobs=-1, class_weight=None, scale_pos_weight=final_spw, **final_params, **final_extra)
-        print(f"Training final model ({len(X_final_scaled)} samples)..."); t_start = time.time(); final_model.fit(X_final_scaled, y_final); train_duration = time.time() - t_start
-        print(f"Final training complete ({train_duration:.2f}s).")
-    except Exception as e: print(f"E: Final training: {e}"); traceback.print_exc(); return None, final_scaler, best_params_cleaned, best_avg_metrics, target_column_nday
-
-    # --- 9. Save Artifacts ---
-    # (Giữ nguyên logic lưu trữ)
-    try:
-        print("\nSaving artifacts...")
-        model_suffix = '_gpu.joblib' if use_gpu and LGBM_GPU_SUPPORT else '_cpu.joblib'
-        model_filename = f'lgbm_model_{forecast_horizon}d{model_suffix}'
-        scaler_filename = f'lgbm_scaler_{forecast_horizon}d.joblib'; info_filename = f'lgbm_model_info_{forecast_horizon}d.json'
-        model_path = os.path.join(MODEL_DIR, model_filename); scaler_path = os.path.join(MODEL_DIR, scaler_filename); info_path = os.path.join(MODEL_DIR, info_filename)
-        joblib.dump(final_model, model_path); joblib.dump(final_scaler, scaler_path)
-        print(f"  Model saved: {model_path}"); print(f"  Scaler saved: {scaler_path}")
-        try: skv = joblib.__version__.split('.')[0] + '.' + joblib.__version__.split('.')[1]
-        except: skv = joblib.__version__
-        model_info = {
-            'model_type': f'LGBMClassifier_{forecast_horizon}D_PreProc_v3', 'model_filename': model_filename, 'scaler_filename': scaler_filename,
-            'feature_columns': final_feature_columns, 'target_variable': target_column_nday, 'forecast_horizon_days': forecast_horizon,
-            'training_data_source': PROCESSED_DATA_DIR, 'loaded_tickers': target_tickers, 'final_training_samples': len(X_final_scaled) if 'X_final_scaled' in locals() else None,
-            'training_timestamp': datetime.datetime.now().isoformat(), 'total_optimization_duration_seconds': optimization_duration, 'final_model_train_duration_seconds': train_duration,
-            'optimization_details': { 'method': 'Optuna (TPE, MedianPruner)', 'n_trials_completed': len(completed_trials), 'n_trials_requested': n_trials, 'num_splits_walk_forward': num_splits, 'walk_forward_gap_days': 3, 'use_gpu': use_gpu and LGBM_GPU_SUPPORT, 'objective': 'Minimize -(0.4*Acc + 0.6*F1)'},
-            'best_optuna_trial': {'number': best_trial.number, 'score': best_value, 'params': best_params_cleaned, 'raw_params': best_params_raw, 'avg_metrics': best_avg_metrics},
-            'library_versions': {'lightgbm': lgb.__version__ if lgb else None, 'optuna': optuna.__version__, 'sklearn': skv, 'pandas': pd.__version__, 'numpy': np.__version__}
-        }
-        with open(info_path, 'w') as f: json.dump(model_info, f, indent=4, default=default_serializer)
-        print(f"  Model info saved: {info_path}")
-    except Exception as e: print(f"E: Saving artifacts: {e}"); traceback.print_exc()
-
-    return final_model, final_scaler, best_params_cleaned, best_avg_metrics, target_column_nday
-
-
-# --- JSON Serializer Helper ---
-def default_serializer(obj):
-    # (Giữ nguyên logic)
-    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64)): return int(obj)
-    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)): return float(obj) if not pd.isna(obj) else None
-    elif isinstance(obj, np.bool_): return bool(obj)
-    elif isinstance(obj, np.ndarray): return obj.tolist()
-    elif isinstance(obj, (datetime.datetime, datetime.date)): return obj.isoformat()
-    elif isinstance(obj, np.number): return obj.item() if not pd.isna(obj) else None
-    elif isinstance(obj, pd.Timestamp): return obj.isoformat()
-    elif pd.isna(obj): return None
-    try: return repr(obj)
-    except: raise TypeError(f"Type {type(obj)} not serializable")
-
-# --- Main Execution Block ---
-if __name__ == "__main__":
-    print("\n======================================================================")
-    print(" Starting Stock Prediction Model Training (LGBM - N-Day Target) ")
-    print("          >>> Using Pre-Processed Features Only - v3 <<<              ")
-    print("======================================================================")
-    sns.set_style("darkgrid")
-    # --- Configuration ---
-    N_TRIALS_LGBM = 200      # <<< Tăng số trials >>>
-    NUM_SPLITS_LGBM = 5
-    FORECAST_HORIZON = 5
-    USE_GPU_TRAINING = True if LGBM_GPU_SUPPORT else False
-
-    # --- Load Processed File List ---
-    if not os.path.exists(PROCESSED_DATA_DIR): print(f"E: Input dir not found: {PROCESSED_DATA_DIR}"); exit()
-    processed_files = [os.path.join(PROCESSED_DATA_DIR, f) for f in os.listdir(PROCESSED_DATA_DIR) if f.endswith('_processed_data.csv') and os.path.isfile(os.path.join(PROCESSED_DATA_DIR, f))]
-    if not processed_files: print(f"E: No '*_processed_data.csv' found in {PROCESSED_DATA_DIR}"); exit()
-    print(f"\nFound {len(processed_files)} processed files.")
-
-    # --- Run Optuna Optimization ---
-    # <<< SỬA ĐỔI: Không cần truyền feature_columns nữa >>>
-    final_model, final_scaler, best_params, best_metrics, target_column_main = run_optuna_optimization_lgbm(
-        processed_files=processed_files,
-        forecast_horizon=FORECAST_HORIZON,
-        n_trials=N_TRIALS_LGBM,
-        num_splits=NUM_SPLITS_LGBM,
-        use_gpu=USE_GPU_TRAINING,
-    )
-
-    # --- Post-Training Summary ---
-    print("\n=========================================================")
-    print(" Training Process Summary")
-    print("=========================================================")
-    if final_model and final_scaler and best_params and best_metrics and target_column_main:
-        print(f"\n--- LGBM Optuna & Training Successful ({FORECAST_HORIZON}-Day) ---")
-        print("\nBest Hyperparameters:"); print(json.dumps(best_params, indent=2))
-        print("\nBest Avg Metrics (Optuna):"); formatted_metrics = {k: round(v, 4) if isinstance(v, float) else v for k, v in best_metrics.items()}; print(json.dumps(formatted_metrics, indent=2, default=default_serializer))
-        target_accuracy_val = best_metrics.get('accuracy', 0) * 100; target_f1_val = best_metrics.get('f1_positive', 0) * 100
-        print(f"\n---> Avg Val Accuracy: {target_accuracy_val:.2f}%"); print(f"---> Avg Val F1 Score: {target_f1_val:.2f}%")
-        if target_accuracy_val >= 80: print("  ✅ Goal >80% accuracy MET during Optuna!")
-        else: print("  ❌ Goal >80% accuracy NOT MET during Optuna.")
-
-        # Verify saved files
-        print("\nVerifying artifacts...")
-        model_suffix_verify = '_gpu' if USE_GPU_TRAINING and LGBM_GPU_SUPPORT else '_cpu'
-        model_path = os.path.join(MODEL_DIR, f'lgbm_model_{FORECAST_HORIZON}d{model_suffix_verify}.joblib')
-        scaler_path = os.path.join(MODEL_DIR, f'lgbm_scaler_{FORECAST_HORIZON}d.joblib')
-        info_path = os.path.join(MODEL_DIR, f'lgbm_model_info_{FORECAST_HORIZON}d.json')
-        thresh_path = os.path.join(MODEL_DIR, f'lgbm_threshold_info_{FORECAST_HORIZON}d.json')
-        artifacts_ok = True
-        for p, name in [(model_path, "Model"), (scaler_path, "Scaler"), (info_path, "Info")]:
-            if os.path.exists(p): print(f"  ✅ {name} found: {os.path.basename(p)}")
-            else: print(f"  ❌ {name} NOT found: {os.path.basename(p)}"); artifacts_ok = False
-        if artifacts_ok: print("Essential artifacts saved.")
-        else: print("W: Some essential artifacts missing.")
-
-        # --- Feature Importance ---
-        # (Giữ nguyên logic)
-        if os.path.exists(info_path) and final_model:
-            try:
-                print("\n--- Feature Importance (Final Model) ---")
-                with open(info_path, 'r') as f: model_info_imp = json.load(f)
-                final_features = model_info_imp.get('feature_columns')
-                if final_features and hasattr(final_model, 'feature_importances_') and len(final_features) == len(final_model.feature_importances_):
-                    imp_df = pd.DataFrame({'f': final_features, 'i': final_model.feature_importances_}).sort_values('i', ascending=False).reset_index(drop=True)
-                    print("\nTop 30:"); print(imp_df.head(30).to_string())
-                    imp_f = f'lgbm_feature_importance_{FORECAST_HORIZON}d.csv'; imp_p = os.path.join(MODEL_DIR, imp_f)
-                    try: imp_df.to_csv(imp_p, index=False); print(f"\nImportance saved: {imp_f}")
-                    except Exception as e: print(f"E: Saving importance: {e}")
-                    try: plt.figure(figsize=(10, 12)); sns.barplot(x="i", y="f", data=imp_df.head(30), palette="viridis", orient='h'); plt.xlabel("Importance"); plt.ylabel("Feature"); plt.title(f"Top 30 Features ({FORECAST_HORIZON}D)"); plt.tight_layout(); plot_f = f'lgbm_feature_importance_{FORECAST_HORIZON}d.png'; plt.savefig(os.path.join(MODEL_DIR, plot_f)); print(f"Plot saved: {plot_f}"); plt.close()
-                    except Exception as e: print(f"E: Plotting importance: {e}")
-                else: print("W: Could not generate importance (missing info/model data/mismatch).")
-            except Exception as e: print(f"E: Importance analysis: {e}")
-        else: print("\nSkipping Importance (info/model missing).")
-
-        # --- Threshold Tuning ---
-        # (Giữ nguyên logic, bao gồm cả cảnh báo)
-        if os.path.exists(info_path) and final_model and final_scaler and 'df_full_final' in globals() and df_full_final is not None:
-            try:
-                print(f"\n--- Threshold Tuning Example (Last Fold Proxy) ---")
-                print("    <<< WARNING: Thresholds from one fold may not generalize well! >>>")
-                with open(info_path, 'r') as f: mi_thresh = json.load(f)
-                features_thresh = mi_thresh.get('feature_columns')
-                if features_thresh:
-                    split_gen = get_walk_forward_splits_rf(df_full_final, NUM_SPLITS_LGBM, gap_days=3)
-                    _, last_val_fold = None, None; sc = 0
-                    try:
-                        for _, va in split_gen: last_val_fold = va; sc += 1
-                    except ValueError as e: last_val_fold = None; print(f"W: Split gen failed: {e}")
-                    if last_val_fold is not None and not last_val_fold.empty and sc == NUM_SPLITS_LGBM:
-                        print(f"Using last fold (Split {sc}, {len(last_val_fold)} samples).")
-                        X_tune_raw, y_tune = prepare_data_tree_nday(last_val_fold, features_thresh, target_column_main)
-                        if X_tune_raw is not None and not X_tune_raw.empty and y_tune is not None:
-                            X_tune_s = final_scaler.transform(X_tune_raw); y_prob_tune = final_model.predict_proba(X_tune_s)[:, 1]
-                            if np.all(y_prob_tune < 0.01) or np.all(y_prob_tune > 0.99): print("    W: Probabilities skewed. Tuning unreliable.")
-                            prec, rec, thr_pr = precision_recall_curve(y_tune, y_prob_tune); f1s = np.divide(2*prec*rec, prec+rec+1e-9, out=np.zeros_like(prec), where=(prec+rec)>1e-9)[:-1]; thr_f1 = thr_pr
-                            best_thr_f1, best_f1 = 0.5, 0.0
-                            if len(f1s) > 0: idx = np.argmax(f1s); best_thr_f1 = thr_f1[idx]; best_f1 = f1s[idx]
-                            best_acc, best_thr_acc = 0.0, 0.5
-                            for thr in np.arange(0.05, 0.96, 0.01):
-                                acc = accuracy_score(y_tune, (y_prob_tune >= thr).astype(int))
-                                if acc > best_acc: best_acc, best_thr_acc = acc, thr
-                                elif acc == best_acc and abs(thr-0.5) < abs(best_thr_acc-0.5): best_thr_acc = thr
-                            print("\nThreshold Results (Last Fold):")
-                            print(f"  Val Size: {len(y_tune)}, Pos Ratio: {y_tune.mean():.2f}")
-                            acc_def = accuracy_score(y_tune, (y_prob_tune >= 0.5).astype(int)); f1_def = f1_score(y_tune, (y_prob_tune >= 0.5).astype(int), zero_division=0)
-                            f1_at_ba = f1_score(y_tune, (y_prob_tune >= best_thr_acc).astype(int), zero_division=0); acc_at_bf1 = accuracy_score(y_tune, (y_prob_tune >= best_thr_f1).astype(int))
-                            print(f"  Default (0.50): Acc={acc_def:.4f}, F1={f1_def:.4f}")
-                            if best_acc >= 0.99 or best_f1 >= 0.99: print("    <<<< WARNING >>>> Near-perfect scores on tuning fold! Likely UNRELIABLE!")
-                            print(f"  Best Thr (Acc): {best_thr_acc:.2f} -> Acc={best_acc:.4f}, F1={f1_at_ba:.4f}")
-                            print(f"  Best Thr (F1):  {best_thr_f1:.2f} -> Acc={acc_at_bf1:.4f}, F1={best_f1:.4f}")
-                            thresh_info = {'tuning_method': 'Last Fold Proxy', 'size': len(y_tune), 'pos_ratio': y_tune.mean(), 'default_threshold': 0.5, 'default_accuracy': acc_def, 'default_f1': f1_def, 'best_threshold_accuracy': best_thr_acc, 'best_accuracy_on_val': best_acc, 'f1_at_best_accuracy': f1_at_ba, 'best_threshold_f1': best_thr_f1, 'accuracy_at_best_f1': acc_at_bf1, 'best_f1_on_val': best_f1}
-                            thresh_f = f'lgbm_threshold_info_{FORECAST_HORIZON}d.json'; thresh_p = os.path.join(MODEL_DIR, thresh_f)
-                            try: 
-                                with open(thresh_p, 'w') as f: json.dump(thresh_info, f, indent=4, default=default_serializer); print(f"\nThreshold info saved: {thresh_f}")
-                            except Exception as e: print(f"E: Saving threshold info: {e}")
-                        else: print("W: Could not prepare data for tuning.")
-                    else: print(f"W: Could not get last fold ({sc}/{NUM_SPLITS_LGBM}).")
-                else: print("W: Missing features list for tuning.")
-            except Exception as e: print(f"E: Threshold tuning: {e}"); traceback.print_exc()
-        else: print("\nSkipping Threshold Tuning (info/model/data missing).")
-
-        # --- Example Prediction ---
-        # (Giữ nguyên logic)
-        if os.path.exists(info_path) and final_model and final_scaler and processed_files:
-            try:
-                print(f"\n--- Example Prediction ({FORECAST_HORIZON}-Day) ---")
-                with open(info_path, 'r') as f: mi_pred = json.load(f)
-                features_pred = mi_pred.get('feature_columns'); 
-                if not features_pred: raise ValueError("Missing features.")
-                tuned_thr = 0.5; chosen_thr_key = 'best_threshold_f1'
-                thresh_p_load = os.path.join(MODEL_DIR, f'lgbm_threshold_info_{FORECAST_HORIZON}d.json')
-                if os.path.exists(thresh_p_load):
-                    try:
-                        with open(thresh_p_load, 'r') as f: thr_load = json.load(f)
-                        loaded_thr = thr_load.get(chosen_thr_key)
-                        if loaded_thr and 0.05 < loaded_thr < 0.95: tuned_thr = loaded_thr; print(f"Using tuned threshold ({chosen_thr_key}): {tuned_thr:.4f}")
-                        else: print(f"W: Invalid threshold '{chosen_thr_key}'. Using 0.5.")
-                    except Exception as e: print(f"W: Loading threshold failed ({e}). Using 0.5.")
-                else: print(f"Threshold info not found. Using 0.5.")
-                sample_f = processed_files[-1]; print(f"\nLoading sample: {os.path.basename(sample_f)}")
-                try:
-                    sample_df = pd.read_csv(sample_f, index_col='Date', parse_dates=True); sample_df = sample_df.sort_index()
-                    essential_cols = ['Open', 'High', 'Low', 'Close', 'Volume'] # Define locally for prediction scope
-                    sample_df.dropna(subset=essential_cols, how='all', inplace=True) # Clean sample
-                    if not sample_df.empty:
-                        print(f"Prep last row (Sample shape: {sample_df.shape})...")
-                        missing_f = [f for f in features_pred if f not in sample_df.columns]
-                        if missing_f: print(f"  W: Sample missing {len(missing_f)} features. Adding 0."); sample_df = sample_df.reindex(columns=list(sample_df.columns) + missing_f, fill_value=0)
-                        try:
-                            last_row_raw = sample_df[features_pred].iloc[-1:]
-                        except Exception as e:
-                            print(f"E: Selecting features: {e}"); last_row_raw = pd.DataFrame()
-                        if not last_row_raw.empty:
-                            if last_row_raw.isna().any().any() or np.isinf(last_row_raw.values).any():
-                                print(" W: NaN/Inf in last row. Filling 0."); last_row_raw = last_row_raw.fillna(0).replace([np.inf, -np.inf], 0)
-                            X_pred_s = final_scaler.transform(last_row_raw); pred_prob = final_model.predict_proba(X_pred_s)[0, 1]; pred_class = int(pred_prob >= tuned_thr)
-                            last_date = sample_df.index[-1].strftime('%Y-%m-%d'); ticker_p = sample_df.get('Ticker', os.path.basename(sample_f).split('_')[0]).iloc[-1]
-                            print("\n--- Prediction Result ---"); print(f"  Ticker: {ticker_p}, Data up to: {last_date}"); print(f"  Horizon: Next {FORECAST_HORIZON} days"); print("-"*25)
-                            print(f"  Prob (Increase): {pred_prob:.4f}"); print(f"  Threshold: {tuned_thr:.4f} ({chosen_thr_key})"); print(f"  Trend: {pred_class} ({'UP' if pred_class==1 else 'DOWN/STAY'})"); print("-"*25)
-                            conf = abs(pred_prob - 0.5)*2; conf_lvl = "High" if conf > 0.7 else ("Medium" if conf > 0.4 else "Low"); print(f"  Confidence: {conf_lvl} ({conf:.2f})")
-                        else:
-                            print("E: Could not extract last row features.")
-                    else:
-                        print("E: Sample empty after cleaning.")
-                except Exception as e:
-                    print(f"E: Predicting sample: {e}"); traceback.print_exc(limit=2)
-            except Exception as e:
-                print(f"E: Setting up prediction: {e}")
-        else:
-            print("\nSkipping Example Prediction (missing components).")
+            all_preds_binary = (np.array(all_preds_proba) >= 0.5).astype(int)
+            acc = accuracy_score(all_targets, all_preds_binary)
+            f1 = f1_score(all_targets, all_preds_binary, zero_division=0)
+            precision = precision_score(all_targets, all_preds_binary, zero_division=0)
+            recall = recall_score(all_targets, all_preds_binary, zero_division=0)
+        except:
+            acc, f1, precision, recall = 0.0, 0.0, 0.0, 0.0
     else:
-        print("\n--- LGBM Training Failed ---"); print("Check logs for errors.")
-    print("\n========================================================="); print(" Script Finished"); print("=========================================================")
+        all_preds_binary = (np.array(all_preds_proba) >= 0.5).astype(int)
+        acc = accuracy_score(all_targets, all_preds_binary)
+        f1 = f1_score(all_targets, all_preds_binary, zero_division=0)
+        roc_auc = roc_auc_score(all_targets, all_preds_proba)
+        precision = precision_score(all_targets, all_preds_binary, zero_division=0)
+        recall = recall_score(all_targets, all_preds_binary, zero_division=0)
+
+    return avg_loss, acc, f1, roc_auc, precision, recall, all_preds_proba, all_targets
+
+
+# --- Optuna Objective Function for ResNLS ---
+def objective_resnls(
+    trial: optuna.Trial, X_train_val_df: pd.DataFrame, y_train_val_series: pd.Series,
+    feature_names: List[str], num_splits_walk_forward: int,
+    status_callback: Optional[Callable[[str, bool, int], None]] = None
+) -> float:
+    cfg = {
+        "seq_len": trial.suggest_int("seq_len", 30, 120, step=10),
+        "resnet_blocks": trial.suggest_int("resnet_blocks", 1, 3),
+        "resnet_out_channels": trial.suggest_categorical("resnet_out_channels", [32, 64, 128]),
+        "lstm_hidden_size": trial.suggest_categorical("lstm_hidden_size", [64, 128, 256]),
+        "lstm_layers": trial.suggest_int("lstm_layers", 1, 3),
+        "fc_hidden_size": trial.suggest_categorical("fc_hidden_size", [32, 64, 128]),
+        "dropout_rate": trial.suggest_float("dropout_rate", 0.1, 0.5, step=0.1),
+        "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128]),
+        "epochs": trial.suggest_int("epochs", 20, 100, step=10), # Max epochs for Optuna trial
+        "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+    }
+    early_stopping_patience = 10 # For Optuna trials
+
+    def _obj_status(msg, err=False, indent=2): status_callback(msg, err, indent) if status_callback else None
+    _obj_status(f"Optuna Trial {trial.number}: Starting {num_splits_walk_forward} walk-forward splits...")
+
+    tscv = TimeSeriesSplit(n_splits=num_splits_walk_forward)
+    fold_metrics = {'f1_positive': [], 'roc_auc': [], 'accuracy': [], 'precision_positive': [], 'recall_positive': []}
+
+    X_data_trial = X_train_val_df[feature_names].copy()
+    y_data_trial = y_train_val_series.copy()
+
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_data_trial)):
+        _obj_status(f"  Fold {fold+1}/{num_splits_walk_forward}")
+        X_train_fold_df, X_val_fold_df = X_data_trial.iloc[train_idx], X_data_trial.iloc[val_idx]
+        y_train_fold_s, y_val_fold_s = y_data_trial.iloc[train_idx], y_data_trial.iloc[val_idx]
+
+        X_train_seq, y_train_seq = create_sequences(X_train_fold_df, y_train_fold_s, cfg["seq_len"])
+        X_val_seq, y_val_seq = create_sequences(X_val_fold_df, y_val_fold_s, cfg["seq_len"])
+
+        if len(X_train_seq) == 0 or len(X_val_seq) == 0 or len(np.unique(y_val_seq)) < 2:
+            _obj_status(f"  Fold {fold+1}: Skip (insufficient data or single class in val).", True, 3)
+            continue
+
+        train_dataset = StockDataset(X_train_seq, y_train_seq)
+        val_dataset = StockDataset(X_val_seq, y_val_seq)
+        train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
+
+        model = ResNLS(
+            num_features=len(feature_names), seq_len=cfg["seq_len"],
+            resnet_blocks=cfg["resnet_blocks"], resnet_out_channels=cfg["resnet_out_channels"],
+            lstm_hidden_size=cfg["lstm_hidden_size"], lstm_layers=cfg["lstm_layers"],
+            fc_hidden_size=cfg["fc_hidden_size"], dropout_rate=cfg["dropout_rate"]
+        ).to(DEVICE)
+
+        optimizer = optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+        criterion = nn.BCEWithLogitsLoss()
+
+        best_val_f1 = 0
+        epochs_no_improve = 0
+        for epoch in range(cfg["epochs"]):
+            train_loss, train_acc, train_f1 = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
+            val_loss, val_acc, val_f1, val_auc, val_prec, val_recall, _, _ = evaluate_epoch(model, val_loader, criterion, DEVICE)
+
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+
+            if epochs_no_improve >= early_stopping_patience:
+                _obj_status(f"    Fold {fold+1}: Early stopping at epoch {epoch+1}.", False, 4)
+                break
+
+        fold_metrics['f1_positive'].append(val_f1)
+        fold_metrics['roc_auc'].append(val_auc)
+        fold_metrics['accuracy'].append(val_acc)
+        fold_metrics['precision_positive'].append(val_prec)
+        fold_metrics['recall_positive'].append(val_recall)
+
+        trial.report(np.mean(fold_metrics['roc_auc']) if fold_metrics['roc_auc'] else 0.0, fold)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+
+    if not fold_metrics['f1_positive']:
+        _obj_status(f"Trial {trial.number}: All folds skipped or failed. Return 0.0 F1.", True)
+        return 0.0
+
+    avg_f1_positive = np.mean(fold_metrics['f1_positive'])
+    avg_auc = np.mean(fold_metrics['roc_auc'])
+    _obj_status(f"Trial {trial.number}: Avg F1(pos)={avg_f1_positive:.4f}, Avg AUC={avg_auc:.4f}")
+
+    trial.set_user_attr("average_metrics", {k: np.mean(v) if v else 0.0 for k,v in fold_metrics.items()})
+    return avg_f1_positive
+
+# --- Main Training Orchestration for ResNLS Ensemble ---
+def run_optuna_optimization_resnls(
+    processed_files: List[str], forecast_horizon: int, n_trials_optuna: int, num_cv_splits_optuna: int,
+    target_threshold: float = 0.01, train_val_split_ratio: float = 0.8, eval_set_ratio: float = 0.1,
+    num_ensemble_models: int = 5, final_model_epochs: int = 50, final_model_patience: int = 10,
+    status_callback: Optional[Callable[[str, bool, Optional[int]], None]] = None,
+    progress_callback: Optional[Callable[[float, str], None]] = None
+) -> Tuple[Optional[List[str]], Optional[StandardScaler], Optional[Dict], Optional[Dict], Optional[str], Optional[List[str]], Optional[int]]:
+
+    def _status(msg, err=False, indent=0): status_callback(msg,err,indent) if status_callback else print(f"{'  '*indent}[{'ERR' if err else 'INF'}] {msg}")
+    def _progress(val, msg): progress_callback(val,msg) if progress_callback else print(f"Prog: {val*100:.1f}% - {msg}")
+
+    _status(f"Starting ResNLS Ensemble model training pipeline... Device: {DEVICE}"); _progress(0.0, "Initializing...")
+
+    _status("Loading & combining data..."); all_dfs=[]
+    for fp_idx, fp in enumerate(processed_files):
+        try:
+            df = pd.read_csv(fp);
+            df[COL_DATE]=pd.to_datetime(df[COL_DATE], errors='coerce')
+            all_dfs.append(df)
+            _status(f"Loaded {os.path.basename(fp)} ({df.shape})",False,1)
+        except Exception as e: _status(f"Err load {fp}: {e}",True,1); continue
+        _progress(0.01 + 0.09 * (fp_idx+1)/len(processed_files), f"Loading data files...")
+
+    if not all_dfs: _status("No data loaded. Aborting training.",True,0); return (None,)*7
+    combo_df = pd.concat(all_dfs,ignore_index=True)
+    if COL_DATE in combo_df: combo_df=combo_df.set_index(COL_DATE).sort_index()
+    elif isinstance(combo_df.index,pd.DatetimeIndex): combo_df=combo_df.sort_index()
+    else: _status("Date index missing after combining. Abort.",True,0); return (None,)*7
+    _status(f"Combined data shape: {combo_df.shape}",False,1); _progress(0.1, "Data combined.")
+
+    _status("Advanced feature engineering..."); df_eng=engineer_advanced_features(combo_df.copy(),_status); _progress(0.15,"Adv feats done.")
+    _status(f"Target variable creation: {forecast_horizon}d horizon, {target_threshold*100:.2f}% thresh...");
+    df_tgt=create_target_variable(df_eng.copy(),forecast_horizon,target_threshold,_status); _progress(0.20,"Target var done.")
+
+    potential_features = [c for c in df_tgt.columns if c not in [COL_TARGET, COL_TICKER] and df_tgt[c].dtype in [np.int64, np.float64, np.int32, np.float32]]
+    X = df_tgt[potential_features].copy()
+    y = df_tgt[COL_TARGET].copy()
+
+    valid_idx = y.dropna().index.intersection(X.dropna(how='any').index)
+    X = X.loc[valid_idx]; y = y.loc[valid_idx]
+
+    if X.empty or len(X) < 500:
+        _status(f"Insufficient data after cleaning for X ({X.shape}). Aborting.",True,0); return (None,)*7
+    _status(f"X/y shape after cleaning: {X.shape}, {y.shape}",False,1)
+    target_dist = y.value_counts(normalize=True).to_dict()
+    _status(f"Target distribution: {target_dist}",False,1)
+    if len(np.unique(y)) < 2: _status("Target variable has only one class. Aborting.",True,0); return (None,)*7
+    _progress(0.25, "X/y prepared.")
+
+    split_idx_test = int(len(X) * (1 - eval_set_ratio))
+    X_optuna_tv, X_test_final = X.iloc[:split_idx_test], X.iloc[split_idx_test:]
+    y_optuna_tv, y_test_final = y.iloc[:split_idx_test], y.iloc[split_idx_test:]
+
+    _status(f"Data for Optuna (Train/Val): {X_optuna_tv.shape}, Final Hold-Out Test: {X_test_final.shape}",False,1)
+    eval_desc = ""
+    if X_test_final.empty or y_test_final.empty or len(np.unique(y_test_final)) < 2:
+        _status("Final hold-out test set is empty or single-class. Optuna will use all data. Post-hoc eval on this set will be skipped.",True,1)
+        X_optuna_tv, y_optuna_tv = X.copy(), y.copy()
+        X_test_final, y_test_final = pd.DataFrame(), pd.Series()
+        eval_desc = "Skipped (final test set issue or too small)"
+    else:
+        eval_desc = f"Final {eval_set_ratio*100:.0f}% of data ({X_test_final.index.min():%Y-%m-%d} to {X_test_final.index.max():%Y-%m-%d})"
+    _progress(0.30, "Data split (Optuna Train/Val, Final Test).")
+
+    _status("Scaling features...");
+    scaler = StandardScaler()
+    X_optuna_tv_scaled_np = scaler.fit_transform(X_optuna_tv[potential_features])
+    X_optuna_tv_scaled_df = pd.DataFrame(X_optuna_tv_scaled_np, columns=potential_features, index=X_optuna_tv.index)
+
+    X_test_final_scaled_df = pd.DataFrame()
+    if not X_test_final.empty:
+        X_test_final_scaled_np = scaler.transform(X_test_final[potential_features])
+        X_test_final_scaled_df = pd.DataFrame(X_test_final_scaled_np, columns=potential_features, index=X_test_final.index)
+    _progress(0.35, "Features scaled.")
+
+    selected_feature_names = potential_features
+    _status(f"Using {len(selected_feature_names)} features for ResNLS model.", False, 1)
+
+    _status(f"Optuna hyperparameter optimization ({n_trials_optuna} trials)...",False,0)
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+
+    def optuna_status_wrapper(msg, err=False, indent_level=None):
+        _status(msg, err, indent_level if indent_level is not None else 0)
+
+    try:
+        study.optimize(
+            lambda t: objective_resnls(t, X_optuna_tv_scaled_df, y_optuna_tv, selected_feature_names, num_cv_splits_optuna, optuna_status_wrapper),
+            n_trials=n_trials_optuna,
+            callbacks=[lambda s,ft: _progress(0.35 + ((ft.number+1)/n_trials_optuna * 0.35),f"Optuna trial {ft.number+1}/{n_trials_optuna}")]
+        )
+    except optuna.exceptions.OptunaError as e_opt:
+        _status(f"Optuna optimization failed: {e_opt}. Aborting.",True,0); return (None,)*7
+
+    best_params_optuna = study.best_params
+    avg_metrics_optuna = study.best_trial.user_attrs.get("average_metrics", {})
+    best_sequence_length = best_params_optuna.get("seq_len", 60)
+
+    _status(f"Optuna finished. Best trial #{study.best_trial.number} with F1(pos): {study.best_value:.4f}",False,1)
+    _status(f"  Best Params from Optuna: {best_params_optuna}",False,2)
+    _status(f"  Avg Validation Metrics (from best trial's CV): {avg_metrics_optuna}",False,2)
+    _progress(0.70, "Optuna optimization complete.")
+
+    _status(f"Training final ensemble of {num_ensemble_models} ResNLS models...",False,0)
+
+    X_final_train_seq, y_final_train_seq = create_sequences(X_optuna_tv_scaled_df[selected_feature_names], y_optuna_tv, best_sequence_length)
+    if len(X_final_train_seq) == 0:
+         _status(f"Not enough data to form sequences for final model training with seq_len {best_sequence_length}. Aborting.", True, 0); return (None,)*7
+
+    final_train_dataset = StockDataset(X_final_train_seq, y_final_train_seq)
+    final_train_loader = DataLoader(final_train_dataset, batch_size=best_params_optuna["batch_size"], shuffle=True, num_workers=0)
+
+    ensemble_model_paths = []
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for i_model in range(num_ensemble_models):
+        _status(f"  Training ensemble member {i_model+1}/{num_ensemble_models}...", False, 1)
+
+        model = ResNLS(
+            num_features=len(selected_feature_names), seq_len=best_sequence_length,
+            resnet_blocks=best_params_optuna["resnet_blocks"], resnet_out_channels=best_params_optuna["resnet_out_channels"],
+            lstm_hidden_size=best_params_optuna["lstm_hidden_size"], lstm_layers=best_params_optuna["lstm_layers"],
+            fc_hidden_size=best_params_optuna["fc_hidden_size"], dropout_rate=best_params_optuna["dropout_rate"]
+        ).to(DEVICE)
+
+        optimizer = optim.AdamW(model.parameters(), lr=best_params_optuna["lr"], weight_decay=best_params_optuna["weight_decay"])
+        criterion = nn.BCEWithLogitsLoss()
+
+        for epoch in range(final_model_epochs):
+            model.train()
+            for X_batch, y_batch in final_train_loader:
+                X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+                optimizer.zero_grad()
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
+                optimizer.step()
+            if (epoch + 1) % 10 == 0:
+                 _status(f"    Member {i_model+1}, Epoch {epoch+1}/{final_model_epochs}, Loss: {loss.item():.4f}", False, 2)
+            _progress(0.70 + (i_model/num_ensemble_models * 0.15) + ((epoch+1)/(final_model_epochs*num_ensemble_models) * 0.15) , f"Training Ensemble Member {i_model+1}")
+
+
+        model_filename = f"resnls_ensemble_member_{i_model}_{forecast_horizon}d_thr{target_threshold*100:.1f}pct_{ts}.pt"
+        model_path = os.path.join(MODEL_DIR_MT, model_filename)
+        torch.save(model.state_dict(), model_path)
+        ensemble_model_paths.append(model_filename)
+        _status(f"  Saved member {i_model+1} to {model_filename}", False, 1)
+    _progress(0.85, "Ensemble training complete.")
+
+    final_test_metrics = {}
+    optimal_threshold_ensemble = 0.5
+
+    if not X_test_final_scaled_df.empty and not y_test_final.empty and len(np.unique(y_test_final)) >= 2:
+        _status(f"Evaluating ensemble on final hold-out test set ({eval_desc})...", False, 0)
+        X_final_test_seq, y_final_test_seq = create_sequences(X_test_final_scaled_df[selected_feature_names], y_test_final, best_sequence_length)
+
+        if len(X_final_test_seq) > 0:
+            final_test_dataset = StockDataset(X_final_test_seq, y_final_test_seq)
+            final_test_loader = DataLoader(final_test_dataset, batch_size=best_params_optuna["batch_size"], shuffle=False)
+
+            ensemble_predictions_proba = np.zeros((len(X_final_test_seq), num_ensemble_models))
+
+            for i_model, model_fname in enumerate(ensemble_model_paths):
+                model = ResNLS(
+                    num_features=len(selected_feature_names), seq_len=best_sequence_length,
+                    resnet_blocks=best_params_optuna["resnet_blocks"], resnet_out_channels=best_params_optuna["resnet_out_channels"],
+                    lstm_hidden_size=best_params_optuna["lstm_hidden_size"], lstm_layers=best_params_optuna["lstm_layers"],
+                    fc_hidden_size=best_params_optuna["fc_hidden_size"], dropout_rate=best_params_optuna["dropout_rate"]
+                ).to(DEVICE)
+                model.load_state_dict(torch.load(os.path.join(MODEL_DIR_MT, model_fname), map_location=DEVICE))
+                model.eval()
+
+                member_preds_proba = []
+                with torch.no_grad():
+                    for X_batch, _ in final_test_loader:
+                        X_batch = X_batch.to(DEVICE)
+                        outputs = model(X_batch)
+                        probs = torch.sigmoid(outputs).cpu().numpy().flatten()
+                        member_preds_proba.extend(probs)
+                ensemble_predictions_proba[:, i_model] = np.array(member_preds_proba)[:len(ensemble_predictions_proba)]
+
+
+            avg_ensemble_proba = np.mean(ensemble_predictions_proba, axis=1)
+
+            prec, rec, thresh_prc = precision_recall_curve(y_final_test_seq, avg_ensemble_proba, pos_label=1)
+            f1s_prc = np.array([])
+            denom = prec[1:] + rec[1:]
+            if len(prec) > 1 and len(rec) > 1: f1s_prc = np.where(denom > 1e-9, (2 * prec[1:] * rec[1:]) / denom, 0.0)
+
+            if len(f1s_prc) > 0 and len(thresh_prc) == len(f1s_prc):
+                best_f1_idx = np.argmax(f1s_prc)
+                optimal_threshold_ensemble = thresh_prc[best_f1_idx]
+            else:
+                _status("Could not determine optimal threshold robustly from PR curve for ensemble on test set. Using 0.5.", True, 1)
+                optimal_threshold_ensemble = 0.5
+
+            ensemble_preds_binary = (avg_ensemble_proba >= optimal_threshold_ensemble).astype(int)
+
+            final_test_metrics = {
+                'accuracy': accuracy_score(y_final_test_seq, ensemble_preds_binary),
+                'f1_positive': f1_score(y_final_test_seq, ensemble_preds_binary, pos_label=1, zero_division=0),
+                'precision_positive': precision_score(y_final_test_seq, ensemble_preds_binary, pos_label=1, zero_division=0),
+                'recall_positive': recall_score(y_final_test_seq, ensemble_preds_binary, pos_label=1, zero_division=0),
+                'roc_auc': roc_auc_score(y_final_test_seq, avg_ensemble_proba),
+                'confusion_matrix': confusion_matrix(y_final_test_seq, ensemble_preds_binary).tolist(),
+                'optimal_threshold_on_test_set': float(optimal_threshold_ensemble)
+            }
+            _status(f"Ensemble performance on Final Test Set (Thresh: {optimal_threshold_ensemble:.4f}): {final_test_metrics}",False,1)
+        else:
+             _status("Not enough data to form sequences for final test set. Skipping evaluation.", True, 0)
+             eval_desc += " (Skipped evaluation due to insufficient seq data)"
+    else:
+        _status("Final hold-out test set was empty or single-class. Skipping ensemble evaluation on it.",False,1)
+    _progress(0.95, "Final evaluation done.")
+
+    _status("Saving scaler and model information file...",False,0)
+    scaler_filename = f"resnls_scaler_{forecast_horizon}d_thr{target_threshold*100:.1f}pct_{ts}.joblib"
+    scaler_path = os.path.join(MODEL_DIR_MT, scaler_filename)
+    joblib.dump(scaler, scaler_path)
+
+    info_filename = f"resnls_ensemble_info_{forecast_horizon}d_thr{target_threshold*100:.1f}pct_{ts}.json"
+    info_path = os.path.join(MODEL_DIR_MT, info_filename)
+
+    model_info = {
+        'model_type': 'ResNLS_Ensemble',
+        'ensemble_member_filenames': ensemble_model_paths,
+        'scaler_filename': scaler_filename,
+        'training_timestamp_utc': datetime.utcnow().isoformat(),
+        'forecast_horizon_days': forecast_horizon,
+        'target_threshold_percent': target_threshold * 100,
+        'target_variable': COL_TARGET,
+        'sequence_length': best_sequence_length,
+        'feature_columns': selected_feature_names,
+        'optuna_trials': n_trials_optuna,
+        'optuna_cv_splits': num_cv_splits_optuna,
+        'best_optuna_trial_summary': {
+            'trial_number': study.best_trial.number,
+            'value_optimized (f1_pos_avg)': study.best_value,
+            'params': best_params_optuna,
+            'avg_validation_metrics_cv': avg_metrics_optuna
+        },
+        'final_ensemble_evaluation': {
+            'eval_set_description': eval_desc,
+            'metrics': final_test_metrics
+        },
+        'data_summary': {
+            'processed_files_used': [os.path.basename(f) for f in processed_files],
+            'combined_data_shape_initial': combo_df.shape,
+            'data_shape_for_model_X_before_sequencing': X.shape,
+            'target_class_distribution_overall': target_dist,
+            'optuna_train_val_set_period': f"{X_optuna_tv.index.min():%Y-%m-%d} to {X_optuna_tv.index.max():%Y-%m-%d}" if not X_optuna_tv.empty else "N/A",
+        }
+    }
+    try:
+        with open(info_path, 'w') as f:
+            json.dump(model_info, f, indent=4, default=lambda o: str(o) if isinstance(o,(datetime,pd.Timestamp,pd.Series)) else o)
+        _status(f"Ensemble info saved to {info_filename}",False,1)
+    except Exception as e:
+        _status(f"Error saving model info JSON: {e}", True, 1)
+        return (None,)*7
+
+    _progress(1.0,"Pipeline complete."); _status("ResNLS Ensemble training finished successfully.",False,0)
+    return ensemble_model_paths, scaler, best_params_optuna, avg_metrics_optuna, COL_TARGET, selected_feature_names, best_sequence_length
+
+
+# --- CLI Test Section ---
+if __name__ == "__main__":
+    print(f"--- Running ModelTraining (ResNLS Ensemble) Standalone Test ---")
+    print(f"Using device: {DEVICE}")
+
+    def cli_status_callback(message: str, is_error: bool = False, indent_level: Optional[int] = 0):
+        actual_indent = indent_level if indent_level is not None else 0
+        prefix = "  " * actual_indent; level = "ERROR" if is_error else "INFO"
+        print(f"{prefix}[{level}] {message}")
+
+    def cli_progress_callback(progress_value: float, text_message: Optional[str] = None):
+        bar_length = 30; filled_length = int(bar_length * progress_value)
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
+        print(f'\rProgress: |{bar}| {progress_value*100:.1f}% ({text_message or ""})      ', end='')
+        if progress_value >= 1.0: print()
+
+    test_processed_files = []
+    if os.path.exists(PROCESSED_DATA_DIR_MT):
+        all_processed = [os.path.join(PROCESSED_DATA_DIR_MT, f) for f in os.listdir(PROCESSED_DATA_DIR_MT) if f.endswith('_processed_data.csv')]
+        preferred_tickers_test = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'TSLA', 'META', 'LLY', 'V']
+        for ticker_test in preferred_tickers_test:
+            found_file = next((f for f in all_processed if ticker_test.upper() in os.path.basename(f).upper()), None)
+            if found_file and len(test_processed_files) < 5 :
+                if found_file not in test_processed_files: test_processed_files.append(found_file)
+        if not test_processed_files and all_processed:
+             test_processed_files = all_processed[:min(len(all_processed), 2)]
+
+    if not test_processed_files:
+        cli_status_callback("No processed data files found for testing. Please run data collection first.", True)
+    else:
+        cli_status_callback(f"Using files for test: {', '.join([os.path.basename(f) for f in test_processed_files])}")
+
+        test_forecast_horizon = 5
+        test_optuna_trials = 10
+        test_optuna_cv_splits = 2
+        test_target_threshold = 0.01
+        test_num_ensemble = 2
+        test_final_epochs = 15
+
+        cli_status_callback(f"Starting test: Horizon={test_forecast_horizon}d, Optuna Trials={test_optuna_trials}, CV Splits={test_optuna_cv_splits}, Target Thr={test_target_threshold*100:.1f}%, Ensemble Size={test_num_ensemble}")
+
+        model_paths, scaler_obj, optuna_params, optuna_metrics, target_col_name, feat_names, seq_len = run_optuna_optimization_resnls(
+            processed_files=test_processed_files,
+            forecast_horizon=test_forecast_horizon,
+            n_trials_optuna=test_optuna_trials,
+            num_cv_splits_optuna=test_optuna_cv_splits,
+            target_threshold=test_target_threshold,
+            num_ensemble_models=test_num_ensemble,
+            final_model_epochs=test_final_epochs,
+            status_callback=cli_status_callback,
+            progress_callback=cli_progress_callback
+        )
+
+        if model_paths and scaler_obj:
+            cli_status_callback("\n--- ResNLS Ensemble Test Training Successful ---")
+            cli_status_callback(f"  Ensemble model paths: {model_paths}")
+            cli_status_callback(f"  Scaler saved: {scaler_obj is not None}")
+            lr_val = optuna_params.get('lr', 'N/A')
+            lr_str = f"{lr_val:.5f}" if isinstance(lr_val, float) else lr_val
+            cli_status_callback(f"  Best Optuna Params (example): LR={lr_str}, SeqLen={optuna_params.get('seq_len','N/A')}, LSTM Hidden={optuna_params.get('lstm_hidden_size','N/A')}")
+
+            f1_val = optuna_metrics.get('f1_positive',0) if optuna_metrics else 0
+            auc_val = optuna_metrics.get('roc_auc',0) if optuna_metrics else 0
+            cli_status_callback(f"  Avg Optuna CV F1(pos): {f1_val:.4f}, AUC: {auc_val:.4f}")
+            cli_status_callback(f"  Target Column: {target_col_name}, Selected Sequence Length: {seq_len}")
+            cli_status_callback(f"  Number of Features Used: {len(feat_names) if feat_names else 'N/A'}")
+            if feat_names: cli_status_callback(f"  Features sample: {feat_names[:3]}...")
+
+            latest_info_file = None
+            if os.path.exists(MODEL_DIR_MT):
+                info_files = sorted(
+                    [f for f in os.listdir(MODEL_DIR_MT) if f.endswith('_info.json') and f.startswith('resnls_ensemble_info_')],
+                    key=lambda f: os.path.getmtime(os.path.join(MODEL_DIR_MT, f)),
+                    reverse=True
+                )
+                if info_files: latest_info_file = info_files[0]
+
+            if latest_info_file:
+                cli_status_callback(f"  Latest model info file: {latest_info_file}")
+                try:
+                    with open(os.path.join(MODEL_DIR_MT, latest_info_file), 'r') as f_inf:
+                        loaded_info = json.load(f_inf)
+                    final_eval_metrics = loaded_info.get('final_ensemble_evaluation',{}).get('metrics',{})
+                    test_f1 = final_eval_metrics.get('f1_positive', 'N/A')
+                    test_acc = final_eval_metrics.get('accuracy', 'N/A')
+                    test_auc = final_eval_metrics.get('roc_auc', 'N/A')
+                    cli_status_callback(f"  Metrics on Final Test Set (from info file): F1(pos)={test_f1:.4f}, Acc={test_acc:.4f}, AUC={test_auc:.4f}"
+                                        if isinstance(test_f1,float) else f"  Metrics on Final Test Set: F1(pos)={test_f1}, Acc={test_acc}, AUC={test_auc}")
+                except Exception as e:
+                    cli_status_callback(f"  Error verifying info file: {e}",True)
+        else:
+            cli_status_callback("\n--- ResNLS Ensemble Test Training Failed ---", True)
+
+    print("\n--- ModelTraining (ResNLS Ensemble) Standalone Test Complete ---")

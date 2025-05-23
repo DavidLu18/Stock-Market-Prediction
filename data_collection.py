@@ -1,532 +1,807 @@
 import os
+import sys
 import pandas as pd
-import yfinance as yf
-import praw
 import numpy as np
-import requests
-# No sklearn imports here anymore (moved to model_training)
-# from sklearn.cluster import AgglomerativeClustering
-# from sklearn.preprocessing import PolynomialFeatures
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import talib # Keep TA-Lib for primary indicator calculation
+from datetime import datetime, timedelta
 import time
-import datetime
 import traceback
-from pytrends.request import TrendReq
-from bs4 import BeautifulSoup
-import pandas_datareader.data as web
-import warnings
-warnings.filterwarnings('ignore')
+import requests # for yfinance retries
+import json
+from typing import List, Dict, Tuple, Optional, Any, Callable
 
-# Directory setup
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-RAW_DATA_DIR = os.path.join(DATA_DIR, 'raw')
-PROCESSED_DATA_DIR = os.path.join(DATA_DIR, 'processed')
-MODEL_DIR = os.path.join(BASE_DIR, 'models') # Define MODEL_DIR for consistency if needed
+import yfinance as yf
+import talib # Assuming TALIB_AVAILABLE is handled by the calling script or checked here if necessary
+from pytrends.request import TrendReq 
+# import praw # Reddit (PRAW is imported in app.py, DataCollector will use passed client if available)
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer 
+import pandas_datareader.data as pdr 
 
-# Create directories if they don't exist
-for dir_path in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, MODEL_DIR]:
+# --- Directory Setup ---
+SCRIPT_DIR_DC = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR_DC = SCRIPT_DIR_DC # Assuming script is in root or adjust as needed
+DATA_DIR_DC = os.path.join(ROOT_DIR_DC, 'data')
+RAW_DATA_DIR_DC = os.path.join(DATA_DIR_DC, 'raw')
+PROCESSED_DATA_DIR_DC = os.path.join(DATA_DIR_DC, 'processed')
+
+for dir_path in [DATA_DIR_DC, RAW_DATA_DIR_DC, PROCESSED_DATA_DIR_DC]:
     if not os.path.exists(dir_path):
-        try: os.makedirs(dir_path)
-        except OSError as e: print(f"Warning: Could not create directory {dir_path}: {e}")
+        try: os.makedirs(dir_path); print(f"(DataCollector) Created directory: {dir_path}")
+        except OSError as e: print(f"(DataCollector) Error creating directory {dir_path}: {e}")
+
 
 class DataCollector:
     def __init__(self):
-        self.companies = []
-        self.reddit = None
-        try: # Handle potential NLTK data download issue
-            self.sentiment_analyzer = SentimentIntensityAnalyzer()
-        except LookupError:
-            print("NLTK VADER lexicon not found. Downloading...")
-            import nltk
-            try:
-                nltk.download('vader_lexicon')
-                self.sentiment_analyzer = SentimentIntensityAnalyzer()
-            except Exception as e:
-                print(f"Error downloading VADER lexicon: {e}. Sentiment analysis will be limited.")
-                self.sentiment_analyzer = None # Set to None if download fails
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36' # Updated User-Agent
-        })
-        self.data_dir = DATA_DIR
-        self.raw_data_dir = RAW_DATA_DIR
-        self.processed_data_dir = PROCESSED_DATA_DIR
-
-    def setup_reddit_api(self, client_id, client_secret, user_agent):
-        """Initialize Reddit API client"""
-        # (Giữ nguyên logic, chỉ thêm kiểm tra self.sentiment_analyzer)
-        if not self.sentiment_analyzer:
-            print("Warning: Sentiment Analyzer not available, Reddit sentiment scores will be limited.")
+        self.companies: List[Dict[str, str]] = []
+        self.reddit_client: Optional[Any] = None # praw.Reddit instance
+        self.vader_analyzer: SentimentIntensityAnalyzer = SentimentIntensityAnalyzer()
         try:
-            if not client_id or not client_secret or not user_agent: return False
-            self.reddit = praw.Reddit(client_id=client_id, client_secret=client_secret, user_agent=user_agent)
-            _ = self.reddit.subreddit("wallstreetbets").display_name # Test authentication
-            print("Reddit API client initialized successfully")
-            return True
-        except Exception as e: print(f"Error initializing Reddit API: {str(e)}"); return False
-
-    def get_top_companies(self, num_companies=50, progress_callback=None, status_callback=None):
-        """Fetch top N US companies from S&P 500 list."""
-        # (Giữ nguyên logic, đã khá ổn định)
-        if status_callback: status_callback(f"Fetching S&P 500 list ({num_companies} companies)...")
-        try:
-            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            response = self.session.get(url, timeout=20)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            table = soup.find('table', {'class': 'wikitable'})
-            if table is None: raise ValueError("Could not find S&P 500 table.")
-            companies_data = []
-            for row in table.find_all('tr')[1:]:
-                cols = row.find_all('td')
-                if len(cols) >= 2:
-                    ticker = cols[0].text.strip().replace('.', '-')
-                    name = cols[1].text.strip()
-                    if ticker not in ['BF-B', 'BRK-B']: companies_data.append({'ticker': ticker, 'name': name})
-            if not companies_data: raise ValueError("No companies extracted.")
-            self.companies = companies_data[:num_companies]
-            if progress_callback: progress_callback(1, 1)
-            companies_df = pd.DataFrame(self.companies)
-            save_path = os.path.join(self.data_dir, f'top_{len(self.companies)}_companies.csv')
-            companies_df.to_csv(save_path, index=False)
-            if status_callback: status_callback(f"✓ Selected {len(self.companies)} companies (saved: {os.path.basename(save_path)}).")
-            return self.companies
+            self.pytrends: Optional[TrendReq] = TrendReq(hl='en-US', tz=360, retries=3, backoff_factor=0.5)
         except Exception as e:
-            error_msg = f"Error getting top companies: {e}"
-            if status_callback: status_callback(f"Error: {error_msg}")
-            else: print(f"Error: {error_msg}")
-            self.companies = []; return []
+            print(f"Warning: Failed to initialize TrendReq: {e}. Google Trends might be unavailable.")
+            self.pytrends = None
 
-    def collect_stock_data(self, start_date, end_date, progress_callback=None, status_callback=None):
-        """Collect historical OHLCV data using yf.Ticker().history() and save raw."""
-        # (Giữ nguyên logic, đã khá ổn định, lưu file raw)
-        try: start_dt=pd.to_datetime(start_date); end_dt=pd.to_datetime(end_date)
-        except ValueError: msg = "Error: Invalid date format."; status_callback(msg); return {}
-        if not self.companies: msg = "Error: No companies set."; status_callback(msg); return {}
+        self.fred_api_key: Optional[str] = os.environ.get('FRED_API_KEY')
 
-        tickers_to_fetch = [c['ticker'] for c in self.companies]
-        num_tickers = len(tickers_to_fetch)
-        if status_callback: status_callback(f"Collecting stock data for {num_tickers} tickers...")
+        # Standardized column names
+        self.COL_DATE: str = 'Date'
+        self.COL_TICKER: str = 'Ticker'
+        self.COL_OPEN: str = 'Open'
+        self.COL_HIGH: str = 'High'
+        self.COL_LOW: str = 'Low'
+        self.COL_CLOSE: str = 'Close'
+        self.COL_ADJ_CLOSE: str = 'Adj Close'
+        self.COL_VOLUME: str = 'Volume'
 
-        all_stock_data = {}
-        company_map = {c['ticker']: c['name'] for c in self.companies}
+        self.MARKET_INDICATORS_MAP: Dict[str, str] = {
+            'VIX': '^VIX',      # CBOE Volatility Index
+            'TNX': '^TNX',      # 10-Year Treasury Yield
+            'GSPC': '^GSPC'     # S&P 500 Index (as a general market proxy)
+        }
+        self.FRED_SERIES_MAP: Dict[str, str] = {
+            'FEDFUNDS': 'FEDFUNDS', # Effective Federal Funds Rate
+            # Add more FRED series here if desired, e.g., 'UNRATE' for Unemployment
+        }
+        self.sp500_companies_df: Optional[pd.DataFrame] = None
 
-        for i, ticker_symbol in enumerate(tickers_to_fetch):
-            if status_callback: status_callback(f"Fetching {ticker_symbol} ({i+1}/{num_tickers})...")
-            try:
-                ticker_obj = yf.Ticker(ticker_symbol)
-                end_date_yf = (end_dt + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                stock_data = ticker_obj.history(start=start_date, end=end_date_yf, interval="1d", actions=True, auto_adjust=False)
+    def _status_update(self, message: str, status_callback: Optional[Callable[[str, bool], None]], is_error: bool = False, indent_level: int = 0) -> None:
+        prefix: str = "  " * indent_level
+        if status_callback:
+            status_callback(f"{prefix}{message}", is_error)
+        else:
+            level: str = "ERROR" if is_error else "INFO"
+            print(f"{prefix}[{level}] {message}")
 
-                if not stock_data.empty:
-                    stock_data.reset_index(inplace=True)
-                    date_col = next((col for col in ['Date', 'Datetime'] if col in stock_data.columns), None)
-                    if date_col:
-                         stock_data.rename(columns={date_col: 'Date'}, inplace=True)
-                         stock_data['Date'] = pd.to_datetime(stock_data['Date']).dt.tz_localize(None)
-                    else: continue
-                    stock_data['Ticker'] = ticker_symbol
-                    stock_data['Company'] = company_map.get(ticker_symbol, ticker_symbol)
-                    stock_data.columns = stock_data.columns.str.strip()
-                    cols_to_keep = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits', 'Ticker', 'Company']
-                    stock_data = stock_data[[col for col in cols_to_keep if col in stock_data.columns]]
+    def _progress_update(self, current_val: float, total_val: float, task_name: str, progress_callback: Optional[Callable[[float, str], None]]) -> None:
+        if progress_callback:
+            progress: float = (current_val / total_val) if total_val > 0 else 0.0
+            progress_callback(progress, f"{task_name}: {current_val:.1f}/{total_val:.1f} ({progress*100:.1f}%)")
 
-                    # <<< CẢI TIẾN: Xử lý lỗi/dòng trống cơ bản TRƯỚC KHI LƯU RAW >>>
-                    stock_data[['Open','High','Low','Close','Volume']] = stock_data[['Open','High','Low','Close','Volume']].apply(pd.to_numeric, errors='coerce')
-                    stock_data.dropna(subset=['Open','High','Low','Close','Volume'], how='any', inplace=True) # Yêu cầu tất cả phải hợp lệ
 
-                    if not stock_data.empty:
-                        all_stock_data[ticker_symbol] = stock_data
-                        # Save raw data
-                        ticker_raw_path = os.path.join(self.raw_data_dir, f"{ticker_symbol}_raw_stock.csv") # Đổi tên file raw
-                        try: stock_data.to_csv(ticker_raw_path, index=False)
-                        except Exception as save_err: status_callback(f"Error saving raw {ticker_symbol}: {save_err}")
-                    else: status_callback(f"Warning: No valid OHLCV data after cleaning for {ticker_symbol}")
-                else: status_callback(f"Warning: No data returned for {ticker_symbol}")
-            except Exception as e: status_callback(f"Error fetching {ticker_symbol}: {e}")
-            if progress_callback: progress_callback(i + 1, num_tickers)
-            time.sleep(0.1) # Giảm nhẹ delay
+    def _save_raw_data(self, df: pd.DataFrame, filename: str, sub_dir: str = "", status_callback: Optional[Callable[[str, bool], None]] = None, is_json: bool = False) -> Optional[str]:
+        dir_path: str = os.path.join(RAW_DATA_DIR_DC, sub_dir)
+        if not os.path.exists(dir_path):
+            try: os.makedirs(dir_path)
+            except OSError as e: self._status_update(f"Error creating raw subdir {dir_path}: {e}", status_callback, True); return None
 
-        num_collected = len(all_stock_data)
-        msg = f"✓ Collected & saved raw stock data for {num_collected}/{num_tickers} companies."
-        if status_callback: status_callback(msg)
-        return all_stock_data
-
-    def collect_reddit_sentiment(self, start_date, end_date, subreddits=['stocks', 'wallstreetbets', 'investing'],
-                               progress_callback=None, status_callback=None):
-        """Collect Reddit sentiment, save raw data per ticker."""
-        # (Cải tiến error handling, logging, save raw)
-        try: start_dt = pd.to_datetime(start_date).tz_localize('UTC'); end_dt = pd.to_datetime(end_date).tz_localize('UTC')
-        except ValueError: status_callback("Error: Invalid date format for Reddit."); return {}
-        if not self.companies: status_callback("Error: No companies for sentiment."); return {}
-        if not self.reddit or not self.sentiment_analyzer: status_callback("Reddit API or Analyzer not ready."); return {}
-
-        status_callback(f"Collecting Reddit sentiment ({len(self.companies)} companies)...")
-        sentiment_data_raw = {company['ticker']: [] for company in self.companies} # Store list of posts per ticker
-        search_terms = {c['ticker']: [c['ticker'], f"${c['ticker']}", c['name']] for c in self.companies}
-
-        total_units = len(subreddits) * len(self.companies); completed_units = 0
-        for subreddit_name in subreddits:
-            status_callback(f"  Subreddit: r/{subreddit_name}")
-            try: subreddit = self.reddit.subreddit(subreddit_name)
-            except Exception as sub_err: status_callback(f"  Error accessing r/{subreddit_name}: {sub_err}. Skipping."); completed_units += len(self.companies); continue
-
-            for company in self.companies:
-                ticker = company['ticker']; query = " OR ".join([f'"{t}"' if ' ' in t else t for t in search_terms[ticker]])
-                # status_callback(f"    Searching {ticker}...") # Bớt log
-                try:
-                    submissions = list(subreddit.search(query, sort='new', limit=1000)) # Limit to prevent excessive time
-                    # status_callback(f"    Found {len(submissions)} potential posts for {ticker}") # Bớt log
-                    for sub in submissions:
-                        post_date = datetime.datetime.fromtimestamp(sub.created_utc, tz=datetime.timezone.utc)
-                        if start_dt <= post_date <= end_dt:
-                            post_text = sub.title + ' ' + sub.selftext
-                            sentiment = self.sentiment_analyzer.polarity_scores(post_text)
-                            sentiment_data_raw[ticker].append({
-                                'Date': post_date.strftime('%Y-%m-%d'), # Save date string
-                                'Compound': sentiment['compound'], 'Positive': sentiment['pos'],
-                                'Neutral': sentiment['neu'], 'Negative': sentiment['neg']
-                            })
-                except Exception as search_err: status_callback(f"    Error searching {ticker}: {search_err}")
-                completed_units += 1
-                if progress_callback: progress_callback(completed_units / total_units if total_units > 0 else 0)
-                time.sleep(0.5) # Shorter sleep between companies per sub
-
-        # Save raw sentiment data per ticker
-        num_saved = 0
-        for ticker, posts in sentiment_data_raw.items():
-            if posts:
-                df_raw_sentiment = pd.DataFrame(posts)
-                save_path = os.path.join(self.raw_data_dir, f"{ticker}_reddit_raw.csv")
-                try: df_raw_sentiment.to_csv(save_path, index=False); num_saved += 1
-                except Exception as e: status_callback(f"Error saving raw Reddit for {ticker}: {e}")
-        status_callback(f"✓ Saved raw Reddit data for {num_saved} companies.")
-        if progress_callback: progress_callback(1.0) # Mark as complete
-        # Return None, as processing now reads from saved file
-        return None
-
-    def collect_google_trends(self, start_date, end_date, progress_callback=None, status_callback=None):
-        """Collect Google Trends data using pytrends and save raw."""
-        # (Cải tiến error handling, save raw)
+        filepath: str = os.path.join(dir_path, filename)
         try:
-            start_dt = pd.to_datetime(start_date); end_dt = pd.to_datetime(end_date)
-            timeframe = f"{start_dt.strftime('%Y-%m-%d')} {end_dt.strftime('%Y-%m-%d')}"
-        except ValueError: status_callback("Error: Invalid date format for Trends."); return {}
-        if not self.companies: status_callback("Error: No companies for Trends."); return {}
+            df_to_save = df.copy()
+            if isinstance(df_to_save.index, pd.DatetimeIndex) and df_to_save.index.tz is not None:
+                df_to_save.index = df_to_save.index.tz_localize(None)
 
-        status_callback(f"Collecting Google Trends ({len(self.companies)} companies)...")
-        pytrends = TrendReq(hl='en-US', tz=360, timeout=(10, 25))
-        num_companies = len(self.companies)
-        chunk_size = 5
-        name_to_ticker = {c['name']: c['ticker'] for c in self.companies}
-        all_keywords = [c['name'] for c in self.companies]
-        num_chunks = (num_companies + chunk_size - 1) // chunk_size
-        num_saved = 0
-
-        for i in range(0, num_companies, chunk_size):
-            chunk_keywords = all_keywords[i:min(i + chunk_size, num_companies)]
-            chunk_tickers = [name_to_ticker[name] for name in chunk_keywords]
-            current_chunk_num = (i // chunk_size) + 1
-            if i > 0: time.sleep(20) # Reduced sleep between chunks
-            if status_callback: status_callback(f"  Trends Chunk {current_chunk_num}/{num_chunks} ({', '.join(chunk_tickers)})...")
-            if progress_callback: progress_callback(current_chunk_num -1, num_chunks)
-
-            try:
-                pytrends.build_payload(chunk_keywords, cat=0, timeframe=timeframe, geo='', gprop='')
-                interest_df = pytrends.interest_over_time()
-                if not interest_df.empty and not interest_df['isPartial'].iloc[0]:
-                    for name in chunk_keywords:
-                        ticker = name_to_ticker[name]
-                        if name in interest_df.columns:
-                            daily_trends = interest_df[[name]].resample('D').ffill() # Resample to daily
-                            daily_trends.rename(columns={name: 'Interest'}, inplace=True)
-                            daily_trends.index = pd.to_datetime(daily_trends.index).tz_localize(None) # Naive datetime index
-                            df_to_save = daily_trends.reset_index().rename(columns={'index': 'Date'})
-                            save_path = os.path.join(self.raw_data_dir, f"{ticker}_trends_raw.csv")
-                            try: df_to_save.to_csv(save_path, index=False); num_saved += 1
-                            except Exception as e: status_callback(f"Error saving raw Trends for {ticker}: {e}")
-                        # else: status_callback(f"    Warning: '{name}' not in results for {ticker}.") # Bớt log
-                elif not interest_df.empty and interest_df['isPartial'].iloc[0]: status_callback(f"    Warning: Partial data received for chunk {current_chunk_num}. Skipping.")
-                # else: status_callback(f"    No Trends data found for chunk {current_chunk_num}.") # Bớt log
-
-            except Exception as e: status_callback(f"    Error fetching trends chunk {current_chunk_num}: {e}")
-
-        status_callback(f"✓ Google Trends completed. Saved raw data for {num_saved}/{num_companies} companies.")
-        if progress_callback: progress_callback(1, 1) # Pass two args for completion
-        # Return None, as processing reads from saved file
-        return None
-
-    def collect_fred_data(self, start_date, end_date, series_id='FEDFUNDS', progress_callback=None, status_callback=None):
-        """Collect FRED data and save raw."""
-        # (Giữ nguyên logic, đã khá ổn định, lưu file raw)
-        if status_callback: status_callback(f"Collecting FRED data ({series_id})...")
-        try:
-            start_dt = pd.to_datetime(start_date); end_dt = pd.to_datetime(end_date)
-            fred_data = web.DataReader(series_id, 'fred', start_dt, end_dt)
-            if fred_data.empty: status_callback(f"Warning: No FRED data for {series_id}."); return None
-            fred_data_daily = fred_data.resample('D').ffill()
-            fred_data_daily.index = fred_data_daily.index.tz_localize(None)
-            save_path = os.path.join(self.raw_data_dir, f"{series_id}_raw.csv")
-            fred_data_daily.reset_index().rename(columns={'index': 'Date'}).to_csv(save_path, index=False)
-            if status_callback: status_callback(f"✓ Collected & saved raw FRED data ({series_id}).")
-            if progress_callback: progress_callback(1, 1)
-            return None # Return None, processing reads file
+            if is_json:
+                if df_to_save.index.name == self.COL_DATE or isinstance(df_to_save.index, pd.DatetimeIndex): # If index is date-like
+                    df_to_save = df_to_save.reset_index()
+                # Ensure Date column is string for JSON if it exists
+                if self.COL_DATE in df_to_save.columns and pd.api.types.is_datetime64_any_dtype(df_to_save[self.COL_DATE]):
+                    df_to_save[self.COL_DATE] = df_to_save[self.COL_DATE].dt.strftime('%Y-%m-%dT%H:%M:%S')
+                df_to_save.to_json(filepath, orient='records', lines=True, date_format='iso') # date_format for any remaining datetime objects
+            else: 
+                # For CSV, if index is DatetimeIndex and named 'Date', save it. Otherwise, don't save index if it's just a range.
+                save_index = isinstance(df_to_save.index, pd.DatetimeIndex) or df_to_save.index.name == self.COL_DATE
+                df_to_save.to_csv(filepath, index=save_index)
+            return filepath
         except Exception as e:
-            status_callback(f"Error collecting FRED data ({series_id}): {e}")
-            if progress_callback: progress_callback(1, 1)
+            self._status_update(f"Error saving raw data to {filepath}: {e}", status_callback, True)
             return None
 
-    def _calculate_basic_indicators(self, df, status_callback=None):
-        """Calculate basic technical indicators without TA-Lib (Fallback)."""
-        # (Giữ nguyên logic fallback, đã khá ổn định)
-        ticker = df['Ticker'].iloc[0] if 'Ticker' in df.columns and not df.empty else 'Unknown'
-        if status_callback: status_callback(f"[{ticker}] Calculating basic indicators (TA-Lib fallback)...")
+    def _load_raw_data(self, filename: str, sub_dir: str = "", status_callback: Optional[Callable[[str, bool], None]] = None, 
+                       parse_dates_col_name: Optional[str] = None, index_col_name: Optional[str] = None, is_json: bool = False) -> Optional[pd.DataFrame]:
+        filepath: str = os.path.join(RAW_DATA_DIR_DC, sub_dir, filename)
+        if not os.path.exists(filepath):
+            return None
         try:
-            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-            for col in required_cols:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
-                else: df[col] = 0 # Assign 0 if missing
-            df.fillna(method='ffill', inplace=True); df.fillna(method='bfill', inplace=True); df.fillna(0, inplace=True) # Robust fill
+            df: Optional[pd.DataFrame] = None
+            if is_json:
+                df = pd.read_json(filepath, orient='records', lines=True)
+                if parse_dates_col_name and parse_dates_col_name in df.columns:
+                     df[parse_dates_col_name] = pd.to_datetime(df[parse_dates_col_name])
+                if index_col_name and index_col_name in df.columns:
+                     df = df.set_index(index_col_name)
+            else: 
+                # For CSV, parse 'Date' if it's specified as index or parse_dates target
+                parse_dates_list = [parse_dates_col_name] if parse_dates_col_name and parse_dates_col_name != index_col_name else None
+                if index_col_name == self.COL_DATE and parse_dates_list is None: # If Date is index, ensure it's parsed
+                    parse_dates_list = [self.COL_DATE] 
+                
+                # If 'Date' is the index_col, it will be parsed. If 'Date' is in parse_dates_list, it will be parsed.
+                df = pd.read_csv(filepath, index_col=index_col_name, parse_dates=parse_dates_list or True) # parse_dates=True attempts to parse index
 
-            df['SMA_5'] = df['Close'].rolling(5, min_periods=1).mean()
-            df['SMA_20'] = df['Close'].rolling(20, min_periods=1).mean()
-            df['SMA_50'] = df['Close'].rolling(50, min_periods=1).mean()
-            df['EMA_5'] = df['Close'].ewm(span=5, adjust=False).mean()
-            df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-            delta = df['Close'].diff(); gain = delta.where(delta > 0, 0).rolling(14, min_periods=1).mean(); loss = -delta.where(delta < 0, 0).rolling(14, min_periods=1).mean()
-            rs = gain / loss.replace(0, 1e-6); df['RSI'] = 100 - (100 / (1 + rs)); df['RSI'].fillna(50, inplace=True)
-            ema12 = df['Close'].ewm(span=12, adjust=False).mean(); ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-            df['MACD'] = ema12 - ema26; df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean(); df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
-            df['BB_Middle'] = df['SMA_20']; std = df['Close'].rolling(20, min_periods=1).std().fillna(0)
-            df['BB_Upper'] = df['BB_Middle'] + (std * 2); df['BB_Lower'] = df['BB_Middle'] - (std * 2)
-            n = 14; hh = df['High'].rolling(n, min_periods=1).max(); ll = df['Low'].rolling(n, min_periods=1).min(); denom_k = (hh - ll).replace(0, 1e-6)
-            df['SlowK'] = 100 * ((df['Close'] - ll) / denom_k); df['SlowD'] = df['SlowK'].rolling(3, min_periods=1).mean()
-            df['ADX'] = 0.0 # Placeholder
-            denom_ad = (df['High'] - df['Low']).replace(0, 1e-6); mfm = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / denom_ad; mfv = mfm.fillna(0) * df['Volume']
-            df['Chaikin_AD'] = mfv.cumsum()
-            df['OBV'] = np.where(df['Close'].diff() > 0, df['Volume'], np.where(df['Close'].diff() < 0, -df['Volume'], 0)).cumsum().fillna(0)
-            hl = df['High'] - df['Low']; hc = abs(df['High'] - df['Close'].shift()); lc = abs(df['Low'] - df['Close'].shift())
-            tr = pd.concat([hl, hc, lc], axis=1).max(axis=1); df['ATR'] = tr.rolling(14, min_periods=1).mean()
-            hh14 = df['High'].rolling(14, min_periods=1).max(); ll14 = df['Low'].rolling(14, min_periods=1).min(); denom_w = (hh14 - ll14).replace(0, 1e-6)
-            df['Williams_R'] = -100 * ((hh14 - df['Close']) / denom_w)
-            df['ROC'] = df['Close'].pct_change(10, fill_method=None) * 100
-            tp = (df['High'] + df['Low'] + df['Close']) / 3; sma_tp = tp.rolling(20, min_periods=1).mean(); mad = abs(tp - sma_tp).rolling(20, min_periods=1).mean()
-            df['CCI'] = (tp - sma_tp) / (0.015 * mad).replace(0, 1e-6)
-            df['Close_Open_Ratio'] = (df['Close'] / df['Open'].replace(0, 1e-6)).replace([np.inf, -np.inf], np.nan)
-            df['High_Low_Diff'] = df['High'] - df['Low']
-            df['Close_Prev_Ratio'] = (df['Close'] / df['Close'].shift(1).replace(0, 1e-6)).replace([np.inf, -np.inf], np.nan)
-        except Exception as e: status_callback(f"[{ticker}] Error in basic indicator calc: {e}")
+            if df is None: return None
+
+            if isinstance(df.index, pd.DatetimeIndex):
+                if df.index.tz is not None: df.index = df.index.tz_localize(None)
+                if df.index.name != self.COL_DATE and self.COL_DATE not in df.columns : df.index.name = self.COL_DATE
+            
+            if self.COL_DATE in df.columns and df.index.name != self.COL_DATE:
+                if pd.api.types.is_datetime64_any_dtype(df[self.COL_DATE]) and df[self.COL_DATE].dt.tz is not None:
+                    df[self.COL_DATE] = df[self.COL_DATE].dt.tz_localize(None)
+                if index_col_name is None and parse_dates_col_name == self.COL_DATE :
+                    df = df.set_index(self.COL_DATE)
+            return df
+        except Exception as e:
+            self._status_update(f"Error loading raw data from {filepath}: {e}", status_callback, True)
+            return None
+
+    def fetch_and_save_yfinance_data(self, ticker_symbol: str, start_date_str: str, end_date_str: str,
+                                     data_type_name: str = "stock", status_callback: Optional[Callable[[str, bool], None]] = None, retries: int = 3, delay: int = 5) -> Optional[pd.DataFrame]:
+        self._status_update(f"Fetching {data_type_name} data for {ticker_symbol} ({start_date_str} to {end_date_str})", status_callback, indent_level=1)
+        yf_ticker_obj = yf.Ticker(ticker_symbol.replace('.', '-')) # yfinance prefers '-' for dots in tickers like BRK.B -> BRK-B
+        end_date_yf = (pd.to_datetime(end_date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d') # yfinance end is exclusive
+
+        for attempt in range(retries):
+            try:
+                df = yf_ticker_obj.history(start=start_date_str, end=end_date_yf, interval="1d",
+                                           auto_adjust=False, actions=True) # auto_adjust=False gives Adj Close separately
+                if df.empty:
+                    if attempt < retries - 1: time.sleep(delay); continue
+                    self._status_update(f"No data for {ticker_symbol} after {retries} retries.", status_callback, True, indent_level=1)
+                    return None
+
+                if df.index.tz is not None: 
+                    df.index = df.index.tz_localize(None)
+                df.index.name = self.COL_DATE
+                df.columns = [col.replace(' ', '_') for col in df.columns] # Sanitize column names
+
+                rename_map = {'Adj_Close': self.COL_ADJ_CLOSE, 'Stock_Splits': 'Stock_Splits'} # Ensure our standard names
+                df.rename(columns=rename_map, inplace=True)
+
+                # Ensure essential OHLCV columns exist
+                expected_cols = [self.COL_OPEN, self.COL_HIGH, self.COL_LOW, self.COL_CLOSE, self.COL_ADJ_CLOSE, self.COL_VOLUME]
+                for col in expected_cols:
+                    if col not in df.columns: df[col] = np.nan # Add if missing, to be filled later
+
+                raw_filename = f"{ticker_symbol.upper()}_{data_type_name}_raw.csv"
+                self._save_raw_data(df, raw_filename, sub_dir=data_type_name, status_callback=status_callback)
+                return df
+
+            except requests.exceptions.ConnectionError as e: # More specific yfinance connection error
+                self._status_update(f"Connection error for {ticker_symbol} (attempt {attempt+1}/{retries}): {e}", status_callback, True, indent_level=1)
+                if attempt < retries - 1: time.sleep(delay)
+                else: self._status_update(f"Failed to fetch {ticker_symbol} after {retries} retries due to ConnectionError.", status_callback, True, indent_level=1); return None
+            except Exception as e: # Catch other potential yfinance errors
+                self._status_update(f"yfinance error for {ticker_symbol} (attempt {attempt+1}/{retries}): {e}", status_callback, True, indent_level=1)
+                if attempt < retries - 1: time.sleep(delay)
+                else: self._status_update(f"Failed to fetch {ticker_symbol} after {retries} retries: {e}", status_callback, True, indent_level=1); return None
+        return None
+        
+    def fetch_and_save_fred_data(self, series_map: Dict[str, str], start_date_dt: datetime, end_date_dt: datetime, status_callback: Optional[Callable[[str, bool], None]] = None) -> Dict[str, pd.DataFrame]:
+        self._status_update(f"Fetching FRED data for series: {', '.join(series_map.keys())}", status_callback, indent_level=1)
+        all_fred_data: Dict[str, pd.DataFrame] = {}
+        for series_name, fred_id in series_map.items():
+            try:
+                df_series = pdr.get_data_fred(fred_id, start_date_dt, end_date_dt, api_key=self.fred_api_key)
+                if df_series.empty:
+                    self._status_update(f"No data for FRED series {fred_id}.", status_callback, True, indent_level=2)
+                    continue
+
+                if df_series.index.tz is not None: 
+                    df_series.index = df_series.index.tz_localize(None)
+                df_series.index.name = self.COL_DATE
+                df_series.rename(columns={fred_id: series_name}, inplace=True) # Rename column to our internal name
+
+                raw_filename = f"{series_name}_fred_raw.csv"
+                self._save_raw_data(df_series, raw_filename, sub_dir="fred", status_callback=status_callback)
+                all_fred_data[series_name] = df_series
+            except Exception as e:
+                self._status_update(f"Error fetching FRED series {fred_id}: {e}", status_callback, True, indent_level=2)
+        return all_fred_data
+
+    def setup_reddit_api(self, client_id: str, client_secret: str, user_agent: str, status_callback: Callable[[str, bool], None] = print) -> bool:
+        if not all([client_id, client_secret, user_agent]):
+            self._status_update("Reddit API credentials incomplete. Reddit collection disabled.", status_callback, is_error=True)
+            self.reddit_client = None
+            return False
+        try:
+            import praw # Local import
+            self.reddit_client = praw.Reddit(
+                client_id=client_id, client_secret=client_secret,
+                user_agent=user_agent, read_only=True
+            )
+            # Test connection (optional, PRAW might do lazy init)
+            # self.reddit_client.user.me() # This would require non-read-only scope or fail
+            self._status_update("Reddit API client object created (connection not fully tested yet).", status_callback)
+            return True
+        except ImportError:
+            self._status_update("PRAW library not installed. Reddit collection disabled.", status_callback, is_error=True)
+            self.reddit_client = None
+            return False
+        except Exception as e: # Catch PRAW specific exceptions if known, e.g., praw.exceptions.APIException
+            self._status_update(f"Error initializing Reddit API client: {e}", status_callback, is_error=True)
+            self.reddit_client = None
+            return False
+
+    def fetch_and_save_reddit_sentiment(self, ticker_symbol: str, company_name: str, start_date_dt: datetime, end_date_dt: datetime,
+                                        status_callback: Optional[Callable[[str, bool], None]] = None, subreddits: Optional[List[str]] = None, limit_per_subreddit: int = 50) -> Optional[pd.DataFrame]:
+        if not self.reddit_client:
+            self._status_update("Reddit client not initialized. Skipping Reddit sentiment.", status_callback, True, indent_level=1)
+            return None
+
+        if subreddits is None:
+            subreddits = ['wallstreetbets', 'stocks', 'investing', 'StockMarket', 'SecurityAnalysis', 'options', 'finance'] # Added finance
+
+        self._status_update(f"Fetching Reddit sentiment for {ticker_symbol} (Keywords: {ticker_symbol}, {company_name})", status_callback, indent_level=1)
+
+        search_terms: List[str] = [ticker_symbol.lower(), f"${ticker_symbol.lower()}"] # Common ways to refer to tickers
+        if company_name and company_name.lower() != ticker_symbol.lower():
+            # Add parts of the company name as search terms
+            name_parts = company_name.lower().replace('inc.', '').replace('corp.', '').replace('.', '').replace(',', '').strip().split()
+            if len(name_parts) > 0: search_terms.append(name_parts[0]) # First word
+            if len(name_parts) > 1: search_terms.append(" ".join(name_parts[:2])) # First two words
+        search_terms = list(set(t for t in search_terms if len(t) > 1)) # Unique terms, min length 2
+
+        all_posts_data: List[Dict[str, Any]] = []
+        start_timestamp: int = int(start_date_dt.timestamp())
+        end_timestamp: int = int(end_date_dt.timestamp())
+
+        for subreddit_name in subreddits:
+            try:
+                subreddit = self.reddit_client.subreddit(subreddit_name)
+                # PRAW search query structure: (term1 OR term2)
+                query: str = f"({' OR '.join(search_terms)}) timestamp:{start_timestamp}..{end_timestamp}"
+                
+                posts_collected_count: int = 0
+                # Search submissions (posts)
+                for post in subreddit.search(query, sort='new', syntax='cloudsearch', time_filter='all', limit=limit_per_subreddit):
+                    # Double check timestamp, as Reddit search can be a bit fuzzy with time_filter='all'
+                    if not (start_timestamp <= post.created_utc <= end_timestamp): continue
+
+                    text_content: str = post.title + " " + post.selftext # Combine title and body for sentiment
+                    sentiment_scores: Dict[str, float] = self.vader_analyzer.polarity_scores(text_content)
+                    all_posts_data.append({
+                        'ticker': ticker_symbol, 'created_utc': post.created_utc,
+                        self.COL_DATE: datetime.utcfromtimestamp(post.created_utc).strftime('%Y-%m-%d %H:%M:%S'), 
+                        'subreddit': subreddit_name, 'title': post.title, 'score': post.score,
+                        'num_comments': post.num_comments, 'compound': sentiment_scores['compound'],
+                        'positive': sentiment_scores['pos'], 'neutral': sentiment_scores['neu'],
+                        'negative': sentiment_scores['neg'], 'id': post.id
+                    })
+                    posts_collected_count +=1
+            except Exception as e: # Catch prawcore exceptions or others
+                self._status_update(f"Error searching r/{subreddit_name} for {ticker_symbol}: {e}", status_callback, True, indent_level=2)
+
+        if not all_posts_data:
+            self._status_update(f"No Reddit posts found for {ticker_symbol} in the given period.", status_callback, indent_level=1)
+            return None
+
+        df_posts = pd.DataFrame(all_posts_data)
+        df_posts[self.COL_DATE] = pd.to_datetime(df_posts[self.COL_DATE]).dt.normalize() 
+
+        raw_filename_posts = f"{ticker_symbol.upper()}_reddit_posts_raw.json" # Save detailed posts as JSON
+        self._save_raw_data(df_posts, raw_filename_posts, sub_dir="reddit", status_callback=status_callback, is_json=True)
+
+        if df_posts[self.COL_DATE].dt.tz is not None:
+            df_posts[self.COL_DATE] = df_posts[self.COL_DATE].dt.tz_localize(None)
+
+        agg_sentiment_df = df_posts.groupby(self.COL_DATE).agg(
+            Compound=('compound', 'mean'), Positive=('positive', 'mean'),
+            Neutral=('neutral', 'mean'), Negative=('negative', 'mean'),
+            Count=('id', 'count') # Number of posts per day
+        ).reset_index() 
+
+        raw_filename_agg = f"{ticker_symbol.upper()}_reddit_sentiment_agg_raw.csv" # Save aggregated sentiment as CSV
+        self._save_raw_data(agg_sentiment_df, raw_filename_agg, sub_dir="reddit", status_callback=status_callback)
+
+        return agg_sentiment_df.set_index(self.COL_DATE) # Return with Date as index for merging
+
+    def fetch_and_save_google_trends(self, ticker_symbol: str, company_name: str, start_date_str: str, end_date_str: str, status_callback: Optional[Callable[[str, bool], None]] = None) -> Optional[pd.DataFrame]:
+        if not self.pytrends:
+            self._status_update("Pytrends client not initialized. Skipping Google Trends.", status_callback, True, indent_level=1)
+            return None
+
+        keywords: List[str] = [ticker_symbol] # Always include ticker
+        if company_name and company_name.lower() != ticker_symbol.lower():
+            simple_name: str = company_name.split(' ')[0] # First word of company name
+            if len(simple_name) > 2 and simple_name.lower() not in ticker_symbol.lower() : # Avoid redundancy if ticker is like 'MSFT' and name 'Microsoft'
+                 keywords.append(simple_name)
+        keywords = list(set(keywords)) # Unique keywords
+
+        self._status_update(f"Fetching Google Trends for {ticker_symbol} (Keywords: {', '.join(keywords)})", status_callback, indent_level=1)
+        timeframe: str = f"{start_date_str} {end_date_str}"
+
+        df_trend_primary: Optional[pd.DataFrame] = None
+        for kw_idx, kw in enumerate(keywords):
+            try:
+                self.pytrends.build_payload(kw_list=[kw], cat=0, timeframe=timeframe, geo='US', gprop='') # Focus on US
+                df_trend_kw: pd.DataFrame = self.pytrends.interest_over_time()
+
+                if df_trend_kw.empty or kw not in df_trend_kw.columns:
+                    continue
+
+                if df_trend_kw.index.tz is not None:
+                    df_trend_kw.index = df_trend_kw.index.tz_localize(None)
+                df_trend_kw.index.name = self.COL_DATE
+
+                raw_filename = f"{ticker_symbol.upper()}_trends_{kw.replace(' ','_')}_raw.csv"
+                self._save_raw_data(df_trend_kw, raw_filename, sub_dir="trends", status_callback=status_callback)
+
+                if kw_idx == 0: # Use the first keyword's trend as the primary one
+                    df_trend_primary = df_trend_kw[[kw]].rename(columns={kw: "Google_Trends"})
+                    if 'isPartial' in df_trend_kw.columns: # Check if 'isPartial' column exists
+                         df_trend_primary['Trends_IsPartial'] = df_trend_kw['isPartial'].astype(int) # Convert boolean to int for easier processing later
+            except requests.exceptions.Timeout:
+                 self._status_update(f"Timeout fetching Google Trends for keyword '{kw}'. Skipping this keyword.", status_callback, True, indent_level=2)
+                 time.sleep(10) # Wait a bit before next keyword
+            except Exception as e: # Catch other pytrends errors (e.g., 429 Too Many Requests)
+                self._status_update(f"Error fetching Google Trends for keyword '{kw}': {e}", status_callback, True, indent_level=2)
+                if "response code 429" in str(e).lower() or "Too Many Requests" in str(e):
+                    self._status_update("Rate limit hit for Google Trends. Waiting 60s.", status_callback, True, indent_level=2)
+                    time.sleep(60) # Wait longer for rate limits
+                else: time.sleep(5) # Shorter wait for other errors
+
+        if df_trend_primary is None:
+            self._status_update(f"No Google Trends data collected for {ticker_symbol} after trying all keywords.", status_callback, indent_level=1)
+        return df_trend_primary
+
+    def _calculate_basic_technical_indicators(self, df_ohlcv: pd.DataFrame, status_callback: Optional[Callable[[str, bool], None]] = None, ticker: str = "N/A") -> pd.DataFrame:
+        df = df_ohlcv.copy()
+
+        required_cols: List[str] = [self.COL_OPEN, self.COL_HIGH, self.COL_LOW, self.COL_CLOSE, self.COL_VOLUME, self.COL_ADJ_CLOSE]
+        for col in required_cols:
+            if col not in df.columns: df[col] = np.nan # Add if missing
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Fill NaNs in OHLCV before TA calculation
+        df[required_cols] = df[required_cols].ffill().bfill() 
+        df[self.COL_VOLUME].fillna(0, inplace=True) # Volume specifically can be 0
+        df.dropna(subset=[self.COL_CLOSE], inplace=True) # Drop if Close is still NaN (shouldn't happen after bfill if any data)
+
+        if df.empty or len(df) < 20: # TA-Lib often needs ~2x period for some indicators
+            self._status_update(f"Data too short for TA calculation for {ticker} after cleaning ({len(df)} rows). Populating TA columns with NaN.", status_callback, True, indent_level=2)
+            # Define a standard set of TA columns that might be expected downstream
+            ta_cols: List[str] = [
+                'SMA_5', 'SMA_10', 'SMA_20', 'SMA_50', 'SMA_100', 'SMA_200',
+                'EMA_5', 'EMA_10', 'EMA_20', 'EMA_50', 'EMA_100', 'EMA_200',
+                'RSI_14', 'MACD', 'MACD_Signal', 'MACD_Hist',
+                'BB_Upper', 'BB_Middle', 'BB_Lower', 'SlowK', 'SlowD', # Stochastic
+                'ADX_14', 'PLUS_DI_14', 'MINUS_DI_14', 'OBV', 'ATR_14', 'WILLR_14', # Williams %R
+                'ROC_5', 'ROC_10', 'ROC_20', 'CCI_20', 'MFI_14', # Commodity Channel Index, Money Flow Index
+                'AD_Line', 'ADOSC', 'TRIX_30' # Accumulation/Distribution Line, AD Oscillator, TRIX
+            ]
+            for ta_col in ta_cols: df[ta_col] = np.nan
+            return df
+
+        # Ensure data types are float for TA-Lib
+        op: np.ndarray = df[self.COL_OPEN].values.astype(float)
+        hi: np.ndarray = df[self.COL_HIGH].values.astype(float)
+        lo: np.ndarray = df[self.COL_LOW].values.astype(float)
+        cl: np.ndarray = df[self.COL_CLOSE].values.astype(float)
+        vo: np.ndarray = df[self.COL_VOLUME].values.astype(float)
+        
+        # Use a global TALIB_AVAILABLE check if preferred, or pass as arg
+        # For now, assuming talib is available if this function is reached with sufficient data
+        try:
+            import talib # Ensure talib is accessible here
+            TALIB_LOADED_LOCALLY = True
+        except ImportError:
+            self._status_update(f"TA-Lib could not be imported in _calculate_basic_technical_indicators for {ticker}. No TA calculated.", status_callback, True, indent_level=2)
+            TALIB_LOADED_LOCALLY = False
+            # Populate with NaNs as above if TALIB is not available here
+            ta_cols = [ # Duplicating list for safety, could be a class member
+                'SMA_5', 'SMA_10', 'SMA_20', 'SMA_50', 'SMA_100', 'SMA_200', 'EMA_5', 'EMA_10', 'EMA_20', 'EMA_50', 'EMA_100', 'EMA_200',
+                'RSI_14', 'MACD', 'MACD_Signal', 'MACD_Hist', 'BB_Upper', 'BB_Middle', 'BB_Lower', 'SlowK', 'SlowD',
+                'ADX_14', 'PLUS_DI_14', 'MINUS_DI_14', 'OBV', 'ATR_14', 'WILLR_14', 'ROC_5', 'ROC_10', 'ROC_20', 
+                'CCI_20', 'MFI_14', 'AD_Line', 'ADOSC', 'TRIX_30'
+            ]
+            for ta_col in ta_cols: df[ta_col] = np.nan
+            return df
+
+
+        with np.errstate(divide='ignore', invalid='ignore'): # Suppress expected warnings from TA-Lib with insufficient data at head/tail
+            for period in [5, 10, 20, 50, 100, 200]:
+                df[f'SMA_{period}'] = talib.SMA(cl, timeperiod=period)
+                df[f'EMA_{period}'] = talib.EMA(cl, timeperiod=period)
+            df['RSI_14'] = talib.RSI(cl, timeperiod=14)
+            macd, macdsignal, macdhist = talib.MACD(cl, fastperiod=12, slowperiod=26, signalperiod=9)
+            df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = macd, macdsignal, macdhist
+            upper, middle, lower = talib.BBANDS(cl, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+            df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = upper, middle, lower
+            slowk, slowd = talib.STOCH(hi, lo, cl, fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)
+            df['SlowK'], df['SlowD'] = slowk, slowd
+            df['ADX_14'] = talib.ADX(hi, lo, cl, timeperiod=14)
+            df['PLUS_DI_14'] = talib.PLUS_DI(hi, lo, cl, timeperiod=14)
+            df['MINUS_DI_14'] = talib.MINUS_DI(hi, lo, cl, timeperiod=14)
+            df['OBV'] = talib.OBV(cl, vo)
+            df['ATR_14'] = talib.ATR(hi, lo, cl, timeperiod=14)
+            df['WILLR_14'] = talib.WILLR(hi, lo, cl, timeperiod=14)
+            for period in [5, 10, 20]: df[f'ROC_{period}'] = talib.ROC(cl, timeperiod=period)
+            df['CCI_20'] = talib.CCI(hi, lo, cl, timeperiod=20)
+            df['MFI_14'] = talib.MFI(hi, lo, cl, vo, timeperiod=14)
+            df['AD_Line'] = talib.AD(hi, lo, cl, vo) # Chaikin A/D Line
+            df['ADOSC'] = talib.ADOSC(hi, lo, cl, vo, fastperiod=3, slowperiod=10) # Chaikin A/D Oscillator
+            df['TRIX_30'] = talib.TRIX(cl, timeperiod=30)
         return df
 
-    def process_data(self, stock_data, progress_callback=None, status_callback=None):
-        """Process data for each stock: Load raw, merge, clean, engineer basic features, save processed."""
-        processed_tickers = []
-        final_feature_cols_list = [] # Store feature list from LAST successful ticker
+    def _engineer_base_features(self, df: pd.DataFrame, ticker: str = "N/A", status_callback: Optional[Callable[[str, bool], None]] = None) -> pd.DataFrame:
+        df_eng = df.copy()
+        adj_cl: pd.Series = df_eng[self.COL_ADJ_CLOSE]
 
-        if not stock_data: status_callback("Error: No stock data provided to process."); return [], []
-        valid_tickers = list(stock_data.keys()); total_tickers = len(valid_tickers)
-        if total_tickers == 0: status_callback("Error: No valid tickers in stock data."); return [], []
-        status_callback("Starting per-ticker data processing...")
+        df_eng['Log_Return'] = np.log(adj_cl / adj_cl.shift(1).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        for lag in [1, 2, 3, 5, 10, 20]: # Common lag periods
+            df_eng[f'Log_Return_Lag_{lag}'] = df_eng['Log_Return'].shift(lag)
 
-        for i, ticker in enumerate(valid_tickers):
-            if status_callback: status_callback(f"Processing {ticker} ({i+1}/{total_tickers})...")
-            if progress_callback: progress_callback(i, total_tickers)
+        raw_vol: pd.Series = df_eng[self.COL_VOLUME]
+        df_eng['Log_Volume'] = np.log(raw_vol.replace(0, 1)) # Replace 0 with 1 before log to avoid -inf
+        for lag in [1, 2, 3, 5]:
+            df_eng[f'Volume_Lag_{lag}'] = raw_vol.shift(lag)
+            df_eng[f'Log_Volume_Lag_{lag}'] = df_eng['Log_Volume'].shift(lag)
 
-            # --- Load RAW Stock Data ---
-            stock_raw_path = os.path.join(self.raw_data_dir, f"{ticker}_raw_stock.csv")
-            if not os.path.exists(stock_raw_path): status_callback(f"[{ticker}] Raw stock file not found. Skipping."); continue
+        for window in [5, 10, 20, 60]: # Volatility over different windows
+            df_eng[f'Volatility_{window}D'] = df_eng['Log_Return'].rolling(window=window, min_periods=max(1,window//2)).std(ddof=0) * np.sqrt(window) # Annualized for window
+
+        # Price ratios
+        df_eng['Close_Open_Ratio'] = (df_eng[self.COL_CLOSE] / df_eng[self.COL_OPEN].replace(0,np.nan)) -1
+        df_eng['High_Low_Ratio'] = (df_eng[self.COL_HIGH] / df_eng[self.COL_LOW].replace(0,np.nan)) -1 # Range relative to low
+        df_eng['High_Close_Ratio'] = (df_eng[self.COL_HIGH] / df_eng[self.COL_CLOSE].replace(0,np.nan)) -1 # Wick size
+        df_eng['Low_Close_Ratio'] = (df_eng[self.COL_LOW] / df_eng[self.COL_CLOSE].replace(0,np.nan)) -1 # Wick size
+
+        if isinstance(df_eng.index, pd.DatetimeIndex):
+            df_eng['Day_Of_Week'] = df_eng.index.dayofweek.astype(float)
+            df_eng['Day_Of_Month'] = df_eng.index.day.astype(float)
+            df_eng['Day_Of_Year'] = df_eng.index.dayofyear.astype(float)
+            df_eng['Week_Of_Year'] = (df_eng.index.isocalendar().week if hasattr(df_eng.index, 'isocalendar') else df_eng.index.weekofyear).astype(float)
+            df_eng['Month'] = df_eng.index.month.astype(float)
+            df_eng['Quarter'] = df_eng.index.quarter.astype(float)
+            df_eng['Year'] = df_eng.index.year.astype(float)
+        else:
+            self._status_update(f"Index is not DatetimeIndex for {ticker}. Cannot create time features.", status_callback, True, indent_level=2)
+        return df_eng
+
+    def _ensure_timezone_naive(self, df: Optional[pd.DataFrame], df_name: str = "DataFrame", status_callback: Optional[Callable[[str, bool], None]] = None) -> Optional[pd.DataFrame]:
+        if df is not None and isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        return df
+
+    def _merge_all_data_sources(self, df_stock_featured: pd.DataFrame, dict_market_indices: Dict[str, pd.DataFrame], dict_fred_data: Dict[str, pd.DataFrame],
+                                df_reddit_sentiment: Optional[pd.DataFrame], df_google_trends: Optional[pd.DataFrame], ticker: str = "N/A", status_callback: Optional[Callable[[str, bool], None]] = None) -> pd.DataFrame:
+        df_merged = self._ensure_timezone_naive(df_stock_featured.copy(), "stock_featured", status_callback)
+
+        if dict_market_indices:
+            for indicator_name, df_indicator_orig in dict_market_indices.items():
+                df_indicator = self._ensure_timezone_naive(df_indicator_orig.copy() if df_indicator_orig is not None else None, indicator_name, status_callback)
+                if df_indicator is not None and not df_indicator.empty:
+                    # Prefer 'Adj Close' for indices if available, else 'Close'
+                    col_to_merge = self.COL_ADJ_CLOSE if self.COL_ADJ_CLOSE in df_indicator.columns else self.COL_CLOSE
+                    if col_to_merge not in df_indicator.columns and len(df_indicator.columns)==1: # If only one column, use that
+                        col_to_merge = df_indicator.columns[0]
+
+                    if col_to_merge in df_indicator.columns:
+                        if indicator_name == 'GSPC': # For S&P 500, calculate market return
+                            gspc_adj_close = df_indicator[col_to_merge]
+                            market_return = np.log(gspc_adj_close / gspc_adj_close.shift(1).replace(0,np.nan)).replace([np.inf,-np.inf],np.nan)
+                            df_indicator_to_merge = pd.DataFrame(market_return).rename(columns={col_to_merge: 'Market_Return'})
+                        else: # For other indices like VIX, TNX, use their value directly
+                            df_indicator_to_merge = df_indicator[[col_to_merge]].rename(columns={col_to_merge: indicator_name})
+                        df_merged = pd.merge(df_merged, df_indicator_to_merge, left_index=True, right_index=True, how='left', suffixes=('', f'_{indicator_name}_val')) # Suffix if name collision
+                    else: self._status_update(f"Relevant column not found in {indicator_name} data for merging.", status_callback, True, indent_level=2)
+
+        if dict_fred_data:
+            for series_name, df_series_orig in dict_fred_data.items():
+                df_series = self._ensure_timezone_naive(df_series_orig.copy() if df_series_orig is not None else None, series_name, status_callback)
+                if df_series is not None and not df_series.empty:
+                    if series_name in df_series.columns:
+                        df_merged = pd.merge(df_merged, df_series[[series_name]], left_index=True, right_index=True, how='left', suffixes=('', f'_{series_name}_val'))
+
+        df_reddit_sentiment = self._ensure_timezone_naive(df_reddit_sentiment.copy() if df_reddit_sentiment is not None else None, "Reddit_Sentiment", status_callback)
+        if df_reddit_sentiment is not None and not df_reddit_sentiment.empty:
+            df_merged = pd.merge(df_merged, df_reddit_sentiment, left_index=True, right_index=True, how='left', suffixes=('', '_Reddit'))
+
+        df_google_trends = self._ensure_timezone_naive(df_google_trends.copy() if df_google_trends is not None else None, "Google_Trends", status_callback)
+        if df_google_trends is not None and not df_google_trends.empty:
+            df_merged = pd.merge(df_merged, df_google_trends, left_index=True, right_index=True, how='left', suffixes=('', '_Trends'))
+
+        # Columns that typically get forward-filled after merging (values persist until new one comes)
+        cols_to_ffill_after_merge: List[str] = [
+            'VIX', 'TNX', 'Market_Return', 'FEDFUNDS', # Market and economic data
+            'Compound', 'Positive', 'Neutral', 'Negative', 'Count', # Reddit sentiment
+            'Google_Trends', 'Trends_IsPartial' # Google Trends
+        ]
+        for col in cols_to_ffill_after_merge:
+            if col in df_merged.columns:
+                df_merged[col] = df_merged[col].ffill()
+        return df_merged
+
+    def _final_data_cleaning_and_typing(self, df: pd.DataFrame, ticker: str = "N/A", status_callback: Optional[Callable[[str, bool], None]] = None) -> pd.DataFrame:
+        df_clean = df.copy()
+        df_clean.replace([np.inf, -np.inf], np.nan, inplace=True) # Handle infinities first
+
+        # Prioritize ffill then bfill for most features to carry forward known info, then backfill for start of series
+        # Finally, fill any remaining NaNs with 0 (neutral value for many features)
+        df_clean = df_clean.ffill().bfill().fillna(0)
+
+        # Type conversion to save memory and ensure consistency
+        for col in df_clean.columns:
+            if df_clean[col].dtype == np.float64:
+                df_clean[col] = df_clean[col].astype(np.float32)
+            elif pd.api.types.is_integer_dtype(df_clean[col].dtype) and not col.startswith('Is_'): # Don't convert 'Is_Partial' if it's int boolean
+                 # Check if integer values can safely fit in float32 if they represent categories or counts
+                 if df_clean[col].min() >= np.finfo(np.float32).min and df_clean[col].max() <= np.finfo(np.float32).max:
+                     df_clean[col] = df_clean[col].astype(np.float32)
+
+        if df_clean.isna().any().any():
+            self._status_update(f"Warning: NaNs still present in data for {ticker} after final cleaning. Columns: {df_clean.columns[df_clean.isna().any()].tolist()}", status_callback, True, indent_level=2)
+        return df_clean
+
+    def _save_processed_data(self, df_processed: pd.DataFrame, ticker: str, status_callback: Optional[Callable[[str, bool], None]] = None) -> Tuple[Optional[str], List[str]]:
+        filename: str = f"{ticker.upper()}_processed_data.csv"
+        filepath: str = os.path.join(PROCESSED_DATA_DIR_DC, filename)
+        try:
+            df_to_save = df_processed.copy()
+            # Ensure Date is a column for CSV, not index, for consistency with how app.py might load it initially
+            if isinstance(df_to_save.index, pd.DatetimeIndex) and df_to_save.index.name == self.COL_DATE:
+                if df_to_save.index.tz is not None: 
+                    df_to_save.index = df_to_save.index.tz_localize(None)
+                df_to_save = df_to_save.reset_index() # Make Date a column
+            
+            # Ensure Date column is tz-naive if it exists
+            if self.COL_DATE in df_to_save.columns:
+                if pd.api.types.is_datetime64_any_dtype(df_to_save[self.COL_DATE]) and df_to_save[self.COL_DATE].dt.tz is not None:
+                    df_to_save[self.COL_DATE] = df_to_save[self.COL_DATE].dt.tz_localize(None)
+
+            df_to_save.to_csv(filepath, index=False) # Always save without index if Date is a column
+            self._status_update(f"Saved processed data for {ticker} to {filepath}", status_callback, indent_level=1)
+            return filepath, df_to_save.columns.tolist()
+        except Exception as e:
+            self._status_update(f"Error saving processed data for {ticker} to {filepath}: {e}", status_callback, True, indent_level=1)
+            return None, []
+
+    def run_full_pipeline(self, companies_to_process: List[Dict[str,str]], start_date_str: str, end_date_str: str,
+                          use_market_indices: bool = True, use_fred_data: bool = True,
+                          use_reddit_sentiment: bool = False, use_google_trends: bool = False,
+                          progress_callback: Optional[Callable[[float, str], None]] = None, status_callback: Optional[Callable[[str, bool], None]] = None) -> Tuple[List[str], List[str]]:
+        self._status_update(f"Starting data collection pipeline for {len(companies_to_process)} companies.", status_callback)
+        start_time_pipeline: float = time.time()
+        start_date_dt: datetime = pd.to_datetime(start_date_str)
+        end_date_dt: datetime = pd.to_datetime(end_date_str)
+
+        market_indices_data_frames: Dict[str, pd.DataFrame] = {}
+        if use_market_indices:
+            self._status_update("--- Collecting Market Indices ---", status_callback)
+            total_indices = len(self.MARKET_INDICATORS_MAP); idx_count = 0
+            for indicator_name, yf_symbol in self.MARKET_INDICATORS_MAP.items():
+                idx_count += 1
+                if progress_callback: progress_callback(idx_count / total_indices * 0.1, f"Market Indices ({indicator_name})") 
+                
+                raw_filename = f"{yf_symbol.upper()}_market_index_raw.csv"
+                df = self._load_raw_data(raw_filename, sub_dir="market_indices", index_col_name=self.COL_DATE, parse_dates_col_name=self.COL_DATE, status_callback=status_callback)
+                if df is None:
+                    df = self.fetch_and_save_yfinance_data(yf_symbol, start_date_str, end_date_str,
+                                                           data_type_name="market_index", status_callback=status_callback)
+                if df is not None: market_indices_data_frames[indicator_name] = df
+
+        fred_series_data_frames: Dict[str, pd.DataFrame] = {}
+        if use_fred_data:
+            self._status_update("--- Collecting FRED Economic Data ---", status_callback)
+            if progress_callback: progress_callback(0.1, f"FRED Data") 
+            
+            temp_fred_dfs: Dict[str, pd.DataFrame] = {}
+            all_fred_loaded_from_cache: bool = True
+            for series_name, fred_id in self.FRED_SERIES_MAP.items():
+                raw_filename_fred = f"{series_name}_fred_raw.csv"
+                df_fred = self._load_raw_data(raw_filename_fred, sub_dir="fred", index_col_name=self.COL_DATE, parse_dates_col_name=self.COL_DATE, status_callback=status_callback)
+                if df_fred is None: all_fred_loaded_from_cache = False; break # If one is missing, fetch all
+                temp_fred_dfs[series_name] = df_fred
+            
+            if all_fred_loaded_from_cache and temp_fred_dfs:
+                fred_series_data_frames = temp_fred_dfs
+                self._status_update("All FRED data loaded from cache.", status_callback, indent_level=1)
+            else:
+                fred_series_data_frames = self.fetch_and_save_fred_data(self.FRED_SERIES_MAP, start_date_dt, end_date_dt, status_callback=status_callback)
+            if progress_callback: progress_callback(0.15, f"FRED Data Complete") 
+
+        self._status_update(f"\n--- Processing Individual Tickers ({len(companies_to_process)} total) ---", status_callback)
+        successfully_processed_tickers: List[str] = []
+        all_feature_columns: List[str] = [] # From the last successfully processed ticker
+        base_progress: float = 0.15 
+        total_ticker_progress: float = 1.0 - base_progress
+
+        for i, company_info in enumerate(companies_to_process):
+            ticker: str = company_info['ticker']
+            company_name_for_search: str = company_info.get('name', ticker)
+            
+            current_ticker_progress_start: float = base_progress + (i / len(companies_to_process) * total_ticker_progress)
+            current_ticker_progress_end: float = base_progress + ((i + 1) / len(companies_to_process) * total_ticker_progress)
+            # Define stages within ticker processing for finer progress updates
+            num_ticker_stages = 6 
+            ticker_progress_step: float = (current_ticker_progress_end - current_ticker_progress_start) / num_ticker_stages
+
+            self._status_update(f"Processing {ticker} ({i+1}/{len(companies_to_process)})", status_callback)
+            if progress_callback: progress_callback(current_ticker_progress_start, f"Ticker {ticker} ({i+1}/{len(companies_to_process)}) - Fetching Stock")
+
+            stock_raw_filename = f"{ticker.upper()}_stock_raw.csv"
+            df_stock_raw = self._load_raw_data(stock_raw_filename, sub_dir="stock", index_col_name=self.COL_DATE, parse_dates_col_name=self.COL_DATE, status_callback=status_callback)
+            if df_stock_raw is None:
+                df_stock_raw = self.fetch_and_save_yfinance_data(ticker, start_date_str, end_date_str,
+                                                                data_type_name="stock", status_callback=status_callback)
+            if df_stock_raw is None or df_stock_raw.empty:
+                self._status_update(f"Failed to load/fetch stock data for {ticker}. Skipping.", status_callback, True); continue
+
+            if progress_callback: progress_callback(current_ticker_progress_start + ticker_progress_step, f"Ticker {ticker} - Calculating TA")
+            df_with_tas = self._calculate_basic_technical_indicators(df_stock_raw, status_callback=status_callback, ticker=ticker)
+
+            if progress_callback: progress_callback(current_ticker_progress_start + 2*ticker_progress_step, f"Ticker {ticker} - Engineering Base Features")
+            df_featured_base = self._engineer_base_features(df_with_tas, ticker=ticker, status_callback=status_callback)
+
+            df_reddit: Optional[pd.DataFrame] = None
+            if use_reddit_sentiment and self.reddit_client: # Check if client was successfully setup
+                if progress_callback: progress_callback(current_ticker_progress_start + 3*ticker_progress_step, f"Ticker {ticker} - Fetching Reddit")
+                reddit_agg_raw_filename = f"{ticker.upper()}_reddit_sentiment_agg_raw.csv" # Aggregated is CSV
+                df_reddit_loaded = self._load_raw_data(reddit_agg_raw_filename, sub_dir="reddit", index_col_name=self.COL_DATE, parse_dates_col_name=self.COL_DATE, status_callback=status_callback, is_json=False) 
+                if df_reddit_loaded is None:
+                    df_reddit = self.fetch_and_save_reddit_sentiment(ticker, company_name_for_search, start_date_dt, end_date_dt, status_callback=status_callback)
+                else: df_reddit = df_reddit_loaded
+
+            df_trends: Optional[pd.DataFrame] = None
+            if use_google_trends:
+                if progress_callback: progress_callback(current_ticker_progress_start + 4*ticker_progress_step, f"Ticker {ticker} - Fetching Trends")
+                primary_kw_trends: str = ticker.upper() # Primary keyword for trend filename convention
+                trends_raw_filename = f"{ticker.upper()}_trends_{primary_kw_trends.replace(' ','_')}_raw.csv"
+                df_trends_loaded = self._load_raw_data(trends_raw_filename, sub_dir="trends", index_col_name=self.COL_DATE, parse_dates_col_name=self.COL_DATE, status_callback=status_callback)
+                if df_trends_loaded is not None: # Try to reconstruct the primary trend df
+                    if "Google_Trends" in df_trends_loaded.columns: df_trends = df_trends_loaded[["Google_Trends"]]
+                    elif primary_kw_trends in df_trends_loaded.columns: df_trends = df_trends_loaded[[primary_kw_trends]].rename(columns={primary_kw_trends: "Google_Trends"})
+                    if df_trends is not None and 'Trends_IsPartial' in df_trends_loaded.columns : df_trends['Trends_IsPartial'] = df_trends_loaded['Trends_IsPartial']
+                
+                if df_trends is None: # If not loaded or load failed to find correct column
+                    df_trends = self.fetch_and_save_google_trends(ticker, company_name_for_search, start_date_str, end_date_str, status_callback=status_callback)
+
+            if progress_callback: progress_callback(current_ticker_progress_start + 5*ticker_progress_step, f"Ticker {ticker} - Merging & Cleaning")
+            df_merged = self._merge_all_data_sources(df_featured_base, market_indices_data_frames,
+                                                    fred_series_data_frames, df_reddit, df_trends,
+                                                    ticker=ticker, status_callback=status_callback)
+            df_final_pre_advanced_feat = self._final_data_cleaning_and_typing(df_merged, ticker=ticker, status_callback=status_callback)
+
+            if df_final_pre_advanced_feat.empty:
+                self._status_update(f"Data for {ticker} became empty after cleaning. Skipping.", status_callback, True); continue
+
+            if self.COL_TICKER not in df_final_pre_advanced_feat.columns: # Ensure Ticker column exists
+                 df_final_pre_advanced_feat[self.COL_TICKER] = ticker
+
+            if progress_callback: progress_callback(current_ticker_progress_end, f"Ticker {ticker} - Saving Processed") # End of this ticker's progress
+            processed_filepath, feature_cols = self._save_processed_data(df_final_pre_advanced_feat, ticker, status_callback=status_callback)
+            if processed_filepath:
+                successfully_processed_tickers.append(ticker)
+                all_feature_columns = feature_cols 
+
+        duration_pipeline: float = time.time() - start_time_pipeline
+        self._status_update(f"\nData collection pipeline finished in {duration_pipeline:.2f} seconds.", status_callback)
+        self._status_update(f"Successfully processed {len(successfully_processed_tickers)} tickers: {', '.join(successfully_processed_tickers)}", status_callback)
+        return successfully_processed_tickers, all_feature_columns
+
+    def load_and_set_companies_list(self, num_companies: Optional[int] = None, status_callback: Callable[[str, bool], None] = print) -> List[Dict[str, str]]:
+        latest_file: Optional[str] = None; latest_num_in_file: int = 0
+        if os.path.exists(DATA_DIR_DC):
             try:
-                df = pd.read_csv(stock_raw_path, parse_dates=['Date'])
-                df['Date'] = pd.to_datetime(df['Date']).dt.normalize() # Normalize date, keep as column
-            except Exception as e: status_callback(f"[{ticker}] Error loading raw stock data: {e}. Skipping."); continue
+                all_top_files: List[str] = [f for f in os.listdir(DATA_DIR_DC) if f.startswith('top_') and f.endswith('_companies.csv')]
+                if all_top_files:
+                    nums: List[int] = []
+                    for f_name in all_top_files:
+                        try: parts = f_name.split('_'); num_str = parts[1]; nums.append(int(num_str))
+                        except (IndexError, ValueError): continue # Skip malformed filenames
+                    if nums: latest_num_in_file = max(nums)
+                if latest_num_in_file > 0:
+                    latest_file = os.path.join(DATA_DIR_DC, f'top_{latest_num_in_file}_companies.csv')
+            except Exception as e: self._status_update(f"Warn: Error finding companies file: {e}", status_callback)
 
-            # --- Load and Prepare RAW Reddit ---
-            reddit_df_agg = pd.DataFrame(columns=['Date', 'Compound', 'Positive', 'Neutral', 'Negative', 'Count']) # Default empty
-            reddit_raw_path = os.path.join(self.raw_data_dir, f"{ticker}_reddit_raw.csv")
-            if os.path.exists(reddit_raw_path):
-                try:
-                    sentiment_df_raw = pd.read_csv(reddit_raw_path, parse_dates=['Date'])
-                    sentiment_df_raw['Date'] = pd.to_datetime(sentiment_df_raw['Date']).dt.normalize() # Normalize date
-                    # Aggregate sentiment per day
-                    reddit_df_agg = sentiment_df_raw.groupby('Date').agg(
-                        Compound=('Compound', 'mean'), Positive=('Positive', 'mean'),
-                        Neutral=('Neutral', 'mean'), Negative=('Negative', 'mean'),
-                        Count=('Date', 'size')
-                    ).reset_index()
-                except Exception as e: status_callback(f"[{ticker}] Error loading/aggregating Reddit: {e}.")
-
-            # --- Load and Prepare RAW Trends ---
-            trends_df = pd.DataFrame(columns=['Date', 'Interest']) # Default empty
-            trends_raw_path = os.path.join(self.raw_data_dir, f"{ticker}_trends_raw.csv")
-            if os.path.exists(trends_raw_path):
-                try:
-                    trends_df_raw = pd.read_csv(trends_raw_path, parse_dates=['date']) # lowercase 'date' from file
-                    trends_df_raw['Date'] = pd.to_datetime(trends_df_raw['date']).dt.normalize() # Normalize and rename
-                    trends_df = trends_df_raw[['Date', 'Interest']].copy()
-                except Exception as e: status_callback(f"[{ticker}] Error loading Trends: {e}.")
-
-            # --- Load and Prepare RAW FRED ---
-            fred_df = pd.DataFrame(columns=['Date', 'FEDFUNDS']) # Default empty
-            fred_series_id = 'FEDFUNDS'
-            fred_raw_path = os.path.join(self.raw_data_dir, f"{fred_series_id}_raw.csv")
-            if os.path.exists(fred_raw_path):
-                try:
-                    fred_df_raw = pd.read_csv(fred_raw_path, parse_dates=['DATE'])
-                    fred_df_raw['Date'] = pd.to_datetime(fred_df_raw['DATE']).dt.normalize() # Normalize date
-                    fred_df = fred_df_raw[['Date', fred_series_id]].copy()
-                    fred_df.rename(columns={fred_series_id: 'FEDFUNDS'}, inplace=True) # Ensure consistent column name
-                except Exception as e: status_callback(f"[{ticker}] Error loading FRED: {e}.")
-
-            # --- Merge all dataframes ---
+        df_companies: Optional[pd.DataFrame] = None
+        if latest_file and os.path.exists(latest_file):
             try:
-                # Merge Reddit
-                if not reddit_df_agg.empty:
-                    df = pd.merge(df, reddit_df_agg, on='Date', how='left')
-                else: # Ensure columns exist if no reddit data
-                    for col in ['Compound', 'Positive', 'Neutral', 'Negative', 'Count']: df[col] = 0
+                df_temp = pd.read_csv(latest_file)
+                # Standardize column names to 'ticker' and 'name'
+                if 'Symbol' in df_temp.columns and 'Name' in df_temp.columns:
+                    df_companies = df_temp[['Symbol', 'Name']].rename(columns={'Symbol': 'ticker', 'Name': 'name'})
+                elif 'ticker' in df_temp.columns and 'name' in df_temp.columns: # If already in desired format
+                    df_companies = df_temp[['ticker', 'name']]
+                
+                if df_companies is not None:
+                    self._status_update(f"Loaded {len(df_companies)} companies from {os.path.basename(latest_file)}", status_callback)
+            except Exception as e: self._status_update(f"Error reading {os.path.basename(latest_file)}: {e}", status_callback, True)
 
-                # Merge Trends
-                if not trends_df.empty:
-                    df = pd.merge(df, trends_df, on='Date', how='left')
-                else: # Ensure column exists if no trends data
-                    df['Interest'] = 0.0 # Keep 0 default for Interest if missing
+        if df_companies is None: # Fallback to default list
+            self._status_update("Warn: Using default company list as no suitable file found or error in loading.", status_callback)
+            default_companies_list: List[Dict[str, str]] = [
+                {'ticker': 'AAPL', 'name': 'Apple Inc.'}, {'ticker': 'MSFT', 'name': 'Microsoft Corp.'},
+                {'ticker': 'GOOGL', 'name': 'Alphabet Inc. (A)'},{'ticker': 'GOOG', 'name': 'Alphabet Inc. (C)'},
+                {'ticker': 'AMZN', 'name': 'Amazon.com, Inc.'}, {'ticker': 'NVDA', 'name': 'NVIDIA Corp.'},
+                {'ticker': 'META', 'name': 'Meta Platforms, Inc.'}, {'ticker': 'TSLA', 'name': 'Tesla, Inc.'}
+            ] # Add more diverse defaults if needed
+            df_companies = pd.DataFrame(default_companies_list)
 
-                # Merge FRED
-                if not fred_df.empty:
-                    df = pd.merge(df, fred_df, on='Date', how='left')
-                else: # Ensure column exists if no FRED data
-                    df['FEDFUNDS'] = np.nan # Use NaN as default for FRED
+        if num_companies is not None and df_companies is not None:
+            df_companies = df_companies.head(num_companies)
 
-                # Set index AFTER all merges
-                df.set_index('Date', inplace=True)
-                df = df[~df.index.duplicated(keep='first')] # Handle duplicate dates if any from merges
-                df = df.sort_index()
-                # status_callback(f"[{ticker}] Merged all raw data sources.") # Bớt log
+        if df_companies is not None:
+            self.companies = df_companies.to_dict('records')
+        else: # Should not happen if default list is used
+            self.companies = []
+        return self.companies
 
-            except Exception as merge_err:
-                status_callback(f"[{ticker}] Error during merge: {merge_err}. Skipping.")
-                continue
-
-            # --- Post-Merge Cleaning ---
-            # Ensure essential columns are numeric
-            essential_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-            for col in essential_cols: df[col] = pd.to_numeric(df[col], errors='coerce')
-            df.dropna(subset=essential_cols, inplace=True) # Drop if OHLCV are NaN
-            if df.empty: status_callback(f"[{ticker}] Empty after essential col cleaning. Skipping."); continue
-
-            # Fill NaNs robustly (Interpolate -> ffill -> bfill -> 0 for most, specific for FRED)
-            numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-            # Define columns needing specific ffill/bfill (rates, trends)
-            cols_to_ffill_bfill = [c for c in [fred_series_id, 'Interest'] if c in df.columns]
-            # Define other numeric columns for interpolation + zero fill
-            cols_to_interpolate_zero = [c for c in numeric_cols if c not in cols_to_ffill_bfill]
-
-            # Apply ffill/bfill first to rates/trends
-            if cols_to_ffill_bfill:
-                df[cols_to_ffill_bfill] = df[cols_to_ffill_bfill].fillna(method='ffill').fillna(method='bfill')
-
-            # Apply interpolation and zero fill to the rest
-            if cols_to_interpolate_zero:
-                df[cols_to_interpolate_zero] = df[cols_to_interpolate_zero].interpolate(method='linear', limit_direction='both', axis=0)
-                df[cols_to_interpolate_zero] = df[cols_to_interpolate_zero].fillna(method='ffill').fillna(method='bfill').fillna(0)
-
-            # --- Outlier Clipping (Z-score > 3 on OHLCV) ---
-            z_thresh = 3
-            for col in essential_cols:
-                if df[col].std() > 1e-6: # Avoid clipping if std is near zero
-                    z_scores = np.abs((df[col] - df[col].mean()) / df[col].std())
-                    df[col] = np.where(z_scores > z_thresh,
-                                      np.sign(df[col] - df[col].mean()) * z_thresh * df[col].std() + df[col].mean(),
-                                      df[col])
-
-            # --- Indicator Calculation ---
-            # status_callback(f"[{ticker}] Calculating indicators...") # Bớt log
-            try:
-                import talib
-                min_period = 50
-                if len(df) < min_period:
-                     status_callback(f"[{ticker}] Warning: Data length ({len(df)}) < {min_period}. Using basic indicators.")
-                     df = self._calculate_basic_indicators(df, status_callback)
-                else: # Use TA-Lib
-                    op = df['Open'].values.astype(float); hi = df['High'].values.astype(float); lo = df['Low'].values.astype(float); cl = df['Close'].values.astype(float); vo = df['Volume'].values.astype(float)
-                    # Calculate all indicators safely
-                    df['SMA_5'] = talib.SMA(cl, 5); df['SMA_20'] = talib.SMA(cl, 20); df['SMA_50'] = talib.SMA(cl, 50)
-                    df['EMA_5'] = talib.EMA(cl, 5); df['EMA_20'] = talib.EMA(cl, 20)
-                    df['RSI'] = talib.RSI(cl, 14)
-                    df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = talib.MACD(cl, 12, 26, 9)
-                    df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = talib.BBANDS(cl, 20, 2, 2, 0)
-                    df['SlowK'], df['SlowD'] = talib.STOCH(hi, lo, cl, 5, 3, 0, 3, 0)
-                    df['ADX'] = talib.ADX(hi, lo, cl, 14)
-                    df['Chaikin_AD'] = talib.AD(hi, lo, cl, vo)
-                    df['OBV'] = talib.OBV(cl, vo)
-                    df['ATR'] = talib.ATR(hi, lo, cl, 14)
-                    df['Williams_R'] = talib.WILLR(hi, lo, cl, 14)
-                    df['ROC'] = talib.ROC(cl, 10)
-                    df['CCI'] = talib.CCI(hi, lo, cl, 20)
-                    df['Close_Open_Ratio'] = (df['Close'] / df['Open'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-                    df['High_Low_Diff'] = df['High'] - df['Low']
-                    df['Close_Prev_Ratio'] = (df['Close'] / df['Close'].shift(1).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-            except ImportError: df = self._calculate_basic_indicators(df, status_callback)
-            except Exception as e: status_callback(f"[{ticker}] Error in indicator calc: {e}"); df = self._calculate_basic_indicators(df, status_callback)
-
-            # --- Basic Feature Engineering (Lags, Vol, Time) ---
-            lags = [1, 3, 5]
-            for lag in lags:
-                df[f'Close_Lag_{lag}'] = df['Close'].shift(lag)
-                df[f'Volume_Lag_{lag}'] = df['Volume'].shift(lag)
-                for col in ['Compound', 'Interest', fred_series_id]: # Lag sentiment, trends, macro if present
-                    if col in df.columns: df[f'{col}_Lag_{lag}'] = df[col].shift(lag)
-            df['Volatility_20D'] = df['Close'].rolling(window=20, min_periods=5).std() # Require min 5 periods
-            df['Day_Of_Week'] = df.index.dayofweek
-
-            # --- Final Cleaning before Target ---
-            df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            df.fillna(method='ffill', inplace=True)
-            df.fillna(method='bfill', inplace=True)
-            df.fillna(0, inplace=True) # Final fill with 0
-
-            # --- Create 1-Day Target for Processed File (N-day target created in model_training) ---
-            if len(df) > 1:
-                df['Close_Next'] = df['Close'].shift(-1)
-                df['Price_Change'] = df['Close_Next'] - df['Close']
-                df['Price_Increase'] = (df['Price_Change'] > 0).astype(int)
-                df.dropna(subset=['Close_Next'], inplace=True) # Drop last row where target is NaN
-            else: df['Price_Increase'] = 0 # Assign default if only 1 row
-
-            if df.empty: status_callback(f"[{ticker}] Empty after final cleaning/target. Skipping save."); continue
-
-            # --- Save Processed Data ---
-            processed_file_path = os.path.join(self.processed_data_dir, f"{ticker}_processed_data.csv")
-            df_to_save = df.reset_index()
-            try:
-                df_to_save.to_csv(processed_file_path, index=False)
-                processed_tickers.append(ticker)
-                final_feature_cols_list = [col for col in df_to_save.columns if col not in ['Date', 'Ticker', 'Company', 'Close_Next', 'Price_Change', 'Price_Increase']]
-                # status_callback(f"[{ticker}] ✓ Saved processed data.") # Bớt log
-            except Exception as e: status_callback(f"[{ticker}] Error saving processed data: {e}")
-
-        if progress_callback: progress_callback(total_tickers, total_tickers)
-        status_callback(f"✓ Data processing complete. Processed {len(processed_tickers)}/{total_tickers} tickers.")
-        return processed_tickers, final_feature_cols_list # Return features from last success
-
-# (main function for CLI execution - giữ nguyên logic)
-def main():
-    collector = DataCollector()
-    start = '2022-01-01'; end = datetime.datetime.now().strftime('%Y-%m-%d'); num = 10
-    def cli_progress(c, t): print(f"\rProgress: {c}/{t}", end='')
-    def cli_status(m): print(f"\nStatus: {m}")
-    companies = collector.get_top_companies(num_companies=num, status_callback=cli_status)
-    if not companies: print("Failed to get companies."); return
-    stock_data = collector.collect_stock_data(start_date=start, end_date=end, progress_callback=cli_progress, status_callback=cli_status)
-    if not stock_data: print("Failed to collect stock data."); return
-    # Add calls to collect Reddit/Trends/FRED raw data here if needed for CLI
-    collector.collect_fred_data(start_date=start, end_date=end, status_callback=cli_status)
-    # ... Add Reddit/Trends calls here ...
-    processed_tickers, features = collector.process_data(stock_data, progress_callback=cli_progress, status_callback=cli_status)
-    print(f"\nCLI Processing Complete. Processed {len(processed_tickers)} tickers.")
-    if processed_tickers: print(f"Features: {features}")
-
+# --- Main execution for testing DataCollector directly ---
 if __name__ == "__main__":
-    main()
+    print("--- Running DataCollector Standalone Test ---")
+
+    def cli_status_callback_main(message: str, is_error: bool = False) -> None:
+        level = "ERROR" if is_error else "INFO"
+        print(f"[{level}] {message}")
+
+    def cli_progress_callback_main(progress_value: float, text_message: Optional[str] = None) -> None:
+        bar_length: int = 30
+        filled_length: int = int(bar_length * progress_value)
+        bar: str = '█' * filled_length + '-' * (bar_length - filled_length)
+        print(f'\rProgress: |{bar}| {progress_value*100:.1f}% ({text_message or ""})      ', end='')
+        if progress_value >= 1.0:
+            print() 
+
+
+    dc = DataCollector()
+    # Test with a small number of companies from the list
+    test_companies_list = dc.load_and_set_companies_list(num_companies=2, status_callback=cli_status_callback_main)
+    if not test_companies_list:
+        cli_status_callback_main("No companies to process for test. Exiting.", True)
+        sys.exit(1)
+
+    cli_status_callback_main(f"Test companies: {[c['ticker'] for c in test_companies_list]}", is_error=False)
+
+    start_date_test_str = (datetime.now() - timedelta(days=3*365 + 90)).strftime('%Y-%m-%d') # Approx 3 years of data
+    end_date_test_str = datetime.now().strftime('%Y-%m-%d')
+
+    # Running the pipeline
+    processed_tickers_list_res, final_features_res = dc.run_full_pipeline(
+        companies_to_process=test_companies_list,
+        start_date_str=start_date_test_str,
+        end_date_str=end_date_test_str,
+        use_market_indices=True,
+        use_fred_data=True,
+        use_reddit_sentiment=False, # Set to True and configure API in app.py/env for full test
+        use_google_trends=True,
+        progress_callback=cli_progress_callback_main,
+        status_callback=cli_status_callback_main
+    )
+
+    print("\n--- DataCollector Standalone Test Complete ---")
+    if processed_tickers_list_res:
+        print(f"Successfully processed: {', '.join(processed_tickers_list_res)}")
+        if final_features_res:
+            print(f"Representative features from last processed file ({len(final_features_res)} total):")
+            print(f"  {', '.join(final_features_res[:10])}{'...' if len(final_features_res) > 10 else ''}")
+
+        # Verification step
+        if os.path.exists(PROCESSED_DATA_DIR_DC) and processed_tickers_list_res:
+            try:
+                test_ticker_to_load_verify = processed_tickers_list_res[0]
+                df_verify_load = pd.read_csv(os.path.join(PROCESSED_DATA_DIR_DC, f"{test_ticker_to_load_verify}_processed_data.csv"))
+                print(f"\nVerified: Loaded {test_ticker_to_load_verify}_processed_data.csv, Shape: {df_verify_load.shape}")
+                
+                print("\nNaN check in verified file (sum per column for columns with NaNs):")
+                nan_summary_verify = df_verify_load.isna().sum()
+                print(nan_summary_verify[nan_summary_verify > 0])
+                if not nan_summary_verify[nan_summary_verify > 0].empty:
+                     print("\nWARNING: NaNs found in processed file. This indicates an issue in the cleaning/filling logic.")
+                else:
+                     print("  No NaNs found in the processed file. Good!")
+
+            except Exception as e_verify:
+                print(f"Error verifying processed file: {e_verify}")
+                traceback.print_exc()
+    else:
+        print("No tickers were processed successfully in the test.")
