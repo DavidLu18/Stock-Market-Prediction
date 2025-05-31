@@ -100,7 +100,6 @@ class StockVolatilityPredictor:
         else: print(f"Progress: {progress*100:.1f}% - {message}")
 
     def load_and_combine_data(self, processed_files: List[str], status_callback: Optional[Callable[[str, bool], None]] = None) -> pd.DataFrame:
-        # This method remains the same
         self._status_update("Đang tải và kết hợp dữ liệu...", status_callback)
         all_data = []
         for file_path in processed_files:
@@ -133,9 +132,9 @@ class StockVolatilityPredictor:
             df_featured['VIX_MA_20D'] = df_featured['VIX'].rolling(20).mean() 
             df_featured['VIX_Ratio_To_MA20'] = df_featured['VIX'] / df_featured['VIX_MA_20D'].replace(0, np.nan)
             df_featured['VIX_Std_10D'] = df_featured['VIX'].rolling(10).std()
-            self._status_update("✅ VIX features created/updated.", status_callback)
+            # self._status_update("✅ VIX features created/updated.", status_callback) # Reduce verbosity
         else:
-            self._status_update("⚠️  Không tìm thấy cột 'VIX'. Bỏ qua features liên quan đến VIX.", status_callback)
+            # self._status_update("⚠️  Không tìm thấy cột 'VIX'. Bỏ qua features liên quan đến VIX.", status_callback)
             if 'VIX_Value' not in df_featured.columns: df_featured['VIX_Value'] = 0.0
 
 
@@ -157,14 +156,19 @@ class StockVolatilityPredictor:
                 for atr_period in [10, 14, 21]:
                     df_featured[f'ATR_{atr_period}'] = talib.ATR(df_featured['High'].values, df_featured['Low'].values, df_featured['Close'].values, timeperiod=atr_period)
                     df_featured[f'ATR_Norm_{atr_period}'] = df_featured[f'ATR_{atr_period}'] / df_featured['Close'].replace(0, np.nan)
-                if 'High' in df_featured and 'Low' in df_featured:
+                
+                if 'High' in df_featured and 'Low' in df_featured: # Redundant check, but safe
                     hl_diff = df_featured['High'] - df_featured['Low']
                     ema_hl_10 = talib.EMA(hl_diff.values, timeperiod=10)
                     ema_hl_20 = talib.EMA(hl_diff.values, timeperiod=20)
+                    
                     safe_ema_hl_20 = ema_hl_20.copy()
                     safe_ema_hl_20[safe_ema_hl_20 == 0] = np.nan 
-                    df_featured['CHAIKIN_VOL_PROXY'] = ((ema_hl_10 - ema_hl_20) / safe_ema_hl_20 * 100).fillna(0)
-            except Exception as e_talib_atr: self._status_update(f"Lỗi tính ATR/Chaikin Proxy: {e_talib_atr}", status_callback)
+                    
+                    # Chuyển kết quả numpy array thành pandas Series trước khi fillna
+                    chaikin_vol_proxy_raw = (ema_hl_10 - ema_hl_20) / safe_ema_hl_20 * 100
+                    df_featured['CHAIKIN_VOL_PROXY'] = pd.Series(chaikin_vol_proxy_raw, index=df_featured.index).fillna(0)
+            except Exception as e_talib_atr: self._status_update(f"Lỗi tính ATR/Chaikin Proxy: {e_talib_atr}", status_callback, True)
         
         if 'High' in df_featured and 'Low' in df_featured:
             log_hl_ratio_sq = (np.log(df_featured['High'] / df_featured['Low'].replace(0, np.nan)))**2
@@ -225,7 +229,7 @@ class StockVolatilityPredictor:
                 df_featured[col] = df_featured[col].ffill().bfill().fillna(0)
         
         final_feature_count = len(df_featured.columns) - len(df.columns)
-        self._status_update(f"Đã tạo/cập nhật {final_feature_count} đặc trưng nâng cao cho biến động (v2)", status_callback)
+        # self._status_update(f"Đã tạo/cập nhật {final_feature_count} đặc trưng nâng cao cho biến động (v2)", status_callback) # Reduce verbosity
         return df_featured
 
     def engineer_ultra_advanced_features(self, df: pd.DataFrame, status_callback: Optional[Callable[[str, bool], None]] = None) -> pd.DataFrame:
@@ -242,7 +246,7 @@ class StockVolatilityPredictor:
             try: 
                 df_featured['ADX_14'] = talib.ADX(df_featured['High'], df_featured['Low'], df_featured['Close'], timeperiod=14)
                 df_featured['Is_Trending_ADX'] = (df_featured['ADX_14'] > 25).astype(int) 
-            except Exception as e_adx: self._status_update(f"Lỗi tính ADX: {e_adx}", status_callback)
+            except Exception as e_adx: self._status_update(f"Lỗi tính ADX: {e_adx}", status_callback, True)
 
         if 'Close' in df_featured.columns:
             close_prices = df_featured['Close']
@@ -258,13 +262,13 @@ class StockVolatilityPredictor:
                 try:
                     df_featured['TEMA_20'] = talib.TEMA(close_prices.values, timeperiod=20)
                     df_featured['Price_vs_TEMA20'] = (df_featured['Close'] - df_featured['TEMA_20']) / df_featured['TEMA_20'].replace(0,np.nan)
-                except Exception as e_tema: self._status_update(f"Lỗi tính TEMA_20: {e_tema}", status_callback)
+                except Exception as e_tema: self._status_update(f"Lỗi tính TEMA_20: {e_tema}", status_callback, True)
 
         df_featured = df_featured.replace([np.inf, -np.inf], np.nan)
         for col in df_featured.columns:
             if col in df_featured.columns and df_featured[col].dtype in ['float64', 'float32', 'float16']:
                 df_featured[col] = df_featured[col].ffill().bfill().fillna(0)
-        self._status_update(f"🚀 Đã tạo thêm features siêu nâng cao (cho biến động - v2) - Tổng cộng {len(df_featured.columns)} features.", status_callback)
+        # self._status_update(f"🚀 Đã tạo thêm features siêu nâng cao (cho biến động - v2) - Tổng cộng {len(df_featured.columns)} features.", status_callback) # Reduce verbosity
         return df_featured
 
     def create_target_variable(self, df: pd.DataFrame, volatility_threshold: float = 0.02, status_callback: Optional[Callable[[str, bool], None]] = None) -> pd.DataFrame:
@@ -301,11 +305,11 @@ class StockVolatilityPredictor:
         for col in feature_columns.copy(): 
             if df[col].isna().sum() / len(df) > 0.6: 
                 feature_columns.remove(col)
-                self._status_update(f"Loại bỏ {col} do >60% NaN", status_callback)
+                # self._status_update(f"Loại bỏ {col} do >60% NaN", status_callback) # Reduce verbosity
         X = df[feature_columns].copy()
         X = X.ffill().bfill().fillna(0) 
         X = X.replace([np.inf, -np.inf], 0) 
-        self._status_update(f"Đã chuẩn bị {len(feature_columns)} đặc trưng cho biến động", status_callback)
+        # self._status_update(f"Đã chuẩn bị {len(feature_columns)} đặc trưng cho biến động", status_callback) # Reduce verbosity
         return X, feature_columns
 
     def advanced_feature_selection(self, X: pd.DataFrame, y: pd.Series, status_callback: Optional[Callable[[str, bool], None]] = None) -> List[str]:
@@ -330,13 +334,13 @@ class StockVolatilityPredictor:
             for feature, mi in mi_scores.items(): feature_scores[feature].append(mi / max_score)
         except Exception as e: self._status_update(f"⚠️ MI feature selection thất bại: {e}", status_callback)
         
-        try: # Add XGBoost importance
+        try: 
             xgb_sel = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42, verbosity=0)
             xgb_sel.fit(X,y)
             xgb_imp = pd.Series(xgb_sel.feature_importances_, index=X.columns)
             max_s = xgb_imp.max(); max_s = 1.0 if max_s == 0 else max_s
             for f, imp_val in xgb_imp.items(): feature_scores[f].append(imp_val / max_s)
-            self._status_update("✅ XGBoost feature importance (cho feature selection) tính toán xong.", status_callback)
+            # self._status_update("✅ XGBoost feature importance (cho feature selection) tính toán xong.", status_callback) # Reduce verbosity
         except Exception as e_xgb_fs: 
             self._status_update(f"⚠️ XGBoost Feature Selection thất bại: {e_xgb_fs}", status_callback)
 
@@ -366,8 +370,7 @@ class StockVolatilityPredictor:
             selected_features = X.columns.tolist()[:20]
 
         self._status_update(f"🎯 Đã chọn {len(selected_features)} features cho dự đoán biến động (v2)", status_callback)
-        if selected_features:
-             self._status_update(f"Top 10 features (biến động - v2): {[f for f in selected_features[:10]]}", status_callback)
+        # if selected_features: self._status_update(f"Top 10 features (biến động - v2): {[f for f in selected_features[:10]]}", status_callback) # Reduce verbosity
         return selected_features
 
     def advanced_data_preprocessing(self, X: pd.DataFrame, y: pd.Series, status_callback: Optional[Callable[[str, bool], None]] = None) -> Tuple[pd.DataFrame, pd.Series]:
@@ -403,7 +406,7 @@ class StockVolatilityPredictor:
                 y_processed = y_processed.reset_index(drop=True)
             except Exception as e: self._status_update(f"⚠️ Loại bỏ outlier thất bại: {e}. Dữ liệu có thể chứa outliers.", status_callback)
         
-        self._status_update(f"🎯 Preprocessing (biến động) hoàn thành: {X_processed.shape[0]} samples, {X_processed.shape[1]} features", status_callback)
+        # self._status_update(f"🎯 Preprocessing (biến động) hoàn thành: {X_processed.shape[0]} samples, {X_processed.shape[1]} features", status_callback) # Reduce verbosity
         return X_processed, y_processed
 
     def smart_class_balancing(self, X: pd.DataFrame, y: pd.Series, strategy: str = 'adaptive',
@@ -461,10 +464,10 @@ class StockVolatilityPredictor:
         except ImportError: OPTUNA_AVAILABLE = False
         
         scale_pos_weight_val = (y_train == 0).sum() / (y_train == 1).sum() if (y_train == 1).sum() > 0 else 1.0
-        self._status_update(f"Calculated scale_pos_weight for training: {scale_pos_weight_val:.2f}", status_callback)
+        # self._status_update(f"Calculated scale_pos_weight for training: {scale_pos_weight_val:.2f}", status_callback) # Reduce verbosity
 
         if OPTUNA_AVAILABLE:
-            self._status_update("✅ Sử dụng Optuna cho Bayesian hyperparameter optimization (Biến Động)", status_callback)
+            # self._status_update("✅ Sử dụng Optuna cho Bayesian hyperparameter optimization (Biến Động)", status_callback) # Reduce verbosity
             def objective(trial): 
                 params = {
                     'objective': 'binary:logistic', 'eval_metric': 'auc', 'tree_method': 'hist', 
@@ -487,14 +490,11 @@ class StockVolatilityPredictor:
             study = optuna.create_study(direction='maximize', pruner=optuna.pruners.MedianPruner(n_warmup_steps=7, n_min_trials=5)) 
             study.optimize(objective, n_trials=50, show_progress_bar=False, n_jobs=1) 
             best_params = study.best_params
-            self._status_update(f"Best trial score (AUC) from Optuna: {study.best_value:.4f}", status_callback)
+            # self._status_update(f"Best trial score (AUC) from Optuna: {study.best_value:.4f}", status_callback) # Reduce verbosity
             
             final_model_params = {**best_params, 'objective': 'binary:logistic', 'eval_metric': 'auc', 
                                   'tree_method': 'hist', 'random_state': 42, 'verbosity': 0, 'n_jobs': -1, 
                                   'early_stopping_rounds': 30, 'scale_pos_weight': scale_pos_weight_val}
-            # n_estimators from best_params is the one Optuna decided was best for the given search space for n_estimators
-            # If early stopping happened, the *actual* number of trees used might be less than this n_estimators.
-            # We want to train the final model with the n_estimators Optuna chose, and let early stopping refine it if needed.
             
             best_model = xgb.XGBClassifier(**final_model_params)
             best_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
@@ -545,7 +545,6 @@ class StockVolatilityPredictor:
             return models_to_ensemble[0][1]
 
     def evaluate_model(self, model, X_test: pd.DataFrame, y_test: pd.Series, status_callback: Optional[Callable[[str, bool], None]] = None) -> Dict[str, float]:
-        # This method remains largely the same
         self._status_update("Đang đánh giá mô hình (dự đoán biến động)...", status_callback)
         y_pred = model.predict(X_test)
         try: y_pred_proba = model.predict_proba(X_test)[:, 1]
@@ -576,7 +575,6 @@ class StockVolatilityPredictor:
         return metrics
 
     def save_model(self, model, scaler: StandardScaler, feature_columns: List[str], metrics: Dict[str, float], target_threshold: float, status_callback: Optional[Callable[[str, bool], None]] = None) -> str:
-        # This method remains largely the same
         self._status_update("Đang lưu mô hình (dự đoán biến động)...", status_callback)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         accuracy_pct = int(metrics['accuracy'] * 100)
@@ -605,7 +603,6 @@ class StockVolatilityPredictor:
         return model_path
 
     def optimize_target_threshold(self, df: pd.DataFrame, status_callback: Optional[Callable[[str, bool], None]] = None) -> float:
-        # This method remains largely the same
         self._status_update("Đang tối ưu ngưỡng BIẾN ĐỘNG...", status_callback)
         if 'Close' not in df.columns: return 0.02
         
@@ -631,7 +628,6 @@ class StockVolatilityPredictor:
         return best_threshold_val
 
     def engineer_deep_learning_inspired_features(self, df: pd.DataFrame, status_callback: Optional[Callable[[str, bool], None]] = None) -> pd.DataFrame:
-        # This method remains largely the same (simplified version)
         self._status_update("Tạo Deep Learning Inspired Features (phiên bản đơn giản hóa)...", status_callback)
         df_deep = df.copy()
         if 'Close' in df_deep.columns:
@@ -643,7 +639,7 @@ class StockVolatilityPredictor:
                 sum_exp_vol_rolling = exp_vol.rolling(window).sum().replace(0, 1e-9)
                 att_weights = exp_vol / sum_exp_vol_rolling
                 df_deep[f'Attention_Price_InvVol_{window}'] = (close_prices * att_weights).rolling(window).sum()
-            self._status_update("✅ Attention-like (InvVol) features created", status_callback)
+            # self._status_update("✅ Attention-like (InvVol) features created", status_callback) # Reduce verbosity
         return df_deep.fillna(0) 
 
     def run_full_training_pipeline(self, processed_files: List[str], target_threshold: float = 0.02,
@@ -651,7 +647,6 @@ class StockVolatilityPredictor:
                                  progress_callback: Optional[Callable[[float, str], None]] = None,
                                  prediction_type: str = 'volatility'
                                  ) -> Tuple[Optional[str], Optional[Dict[str, float]], Optional[List[str]]]:
-        # This method's overall flow remains the same
         self.prediction_type = prediction_type 
         self.target_column = 'Target_Volatility'
 
@@ -680,7 +675,7 @@ class StockVolatilityPredictor:
             initial_rows = len(X)
             good_rows_mask = (X.isna().sum(axis=1) / (X.shape[1] if X.shape[1] > 0 else 1)) <= 0.5 
             X, y = X[good_rows_mask].reset_index(drop=True), y[good_rows_mask].reset_index(drop=True)
-            self._status_update(f"Sau khi loại bỏ hàng nhiều NaN: {len(X)}/{initial_rows} rows còn lại", status_callback)
+            # self._status_update(f"Sau khi loại bỏ hàng nhiều NaN: {len(X)}/{initial_rows} rows còn lại", status_callback) # Reduce verbosity
             if X.empty: raise ValueError("Dữ liệu trống sau khi loại bỏ hàng NaN.")
 
 
@@ -723,6 +718,8 @@ class StockVolatilityPredictor:
             X_test_scaled = pd.DataFrame(X_test_scaled, columns=selected_features, index=X_test.index)
 
             self._progress_update(0.75, "Huấn luyện mô hình XGBoost...", progress_callback)
+            # For more stability, directly use train_xgboost_model.
+            # adaptive_ensemble_selection can be re-enabled if more complexity is desired later.
             model = self.train_xgboost_model(X_train_scaled, y_train, X_val_scaled, y_val, status_callback)
             if model is None: raise ValueError("Huấn luyện mô hình thất bại.")
 
